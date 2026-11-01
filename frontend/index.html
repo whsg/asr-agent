@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Qwen3 Arabisch Live-Transkription</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: system-ui, sans-serif;
+        background: #f3f5f8;
+        color: #172033;
+      }
+
+      body {
+        max-width: 860px;
+        margin: 0 auto;
+        padding: 40px 20px;
+      }
+
+      main {
+        padding: 28px;
+        border-radius: 16px;
+        background: white;
+        box-shadow: 0 8px 32px #16213e12;
+      }
+
+      h1 {
+        margin-top: 0;
+        font-size: 1.7rem;
+      }
+
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin: 24px 0;
+      }
+
+      button {
+        padding: 11px 18px;
+        border: 0;
+        border-radius: 8px;
+        background: #2256d8;
+        color: white;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      button.secondary {
+        background: #e8edf7;
+        color: #1d2b4a;
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: #4a5872;
+        font-size: 0.95rem;
+      }
+
+      .badge::before {
+        content: "";
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: #c3c9d5;
+      }
+
+      .badge[data-state="ok"]::before {
+        background: #16a34a;
+      }
+
+      .badge[data-state="warn"]::before {
+        background: #f59e0b;
+      }
+
+      .badge[data-state="error"]::before {
+        background: #dc2626;
+      }
+
+      #transcript {
+        height: 50vh;
+        min-height: 220px;
+        overflow-y: auto;
+        padding: 20px;
+        border: 1px solid #e0e5ee;
+        border-radius: 10px;
+        background: #fbfcfe;
+        font-size: 1.45rem;
+        line-height: 1.9;
+        overflow-wrap: anywhere;
+      }
+
+      #transcript:empty::before {
+        content: attr(data-placeholder);
+        color: #9aa3b5;
+        font-size: 1rem;
+      }
+
+      #transcript p {
+        margin: 0 0 0.35em;
+      }
+
+      #transcript .interim {
+        color: #8a94a8;
+      }
+
+      .mic-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 20px;
+      }
+
+      .mic-row select {
+        flex: 1 1 260px;
+        min-width: 0;
+        padding: 9px;
+      }
+
+      #level {
+        width: 140px;
+      }
+
+      #warning {
+        color: #b42318;
+        margin: 0 0 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Arabisch live transkribieren</h1>
+      <p>Sprich Arabisch. Der Text erscheint waehrend des Sprechens (grau) und wird nach einer kurzen Pause bestaetigt.</p>
+      <div class="controls">
+        <button id="start" type="button">Mikrofon starten</button>
+        <button id="stop" type="button" disabled>Beenden</button>
+        <span id="status" class="badge" role="status">Bereit</span>
+        <span id="bot" class="badge">ASR-Bot: nicht verbunden</span>
+      </div>
+      <div class="mic-row">
+        <select id="mic" aria-label="Mikrofon"><option value="">Standard-Mikrofon</option></select>
+        <meter id="level" min="0" max="1" value="0" aria-label="Mikrofon-Pegel"></meter>
+      </div>
+      <p id="warning" role="alert" hidden>Das Mikrofon liefert kein Signal. Waehle ein anderes Mikrofon und pruefe, dass es im System nicht stummgeschaltet ist.</p>
+      <div id="transcript" lang="ar" dir="rtl" aria-live="polite" data-placeholder="Der erkannte Text erscheint hier …"></div>
+      <div class="controls">
+        <button id="copy" class="secondary" type="button">Text kopieren</button>
+        <button id="clear" class="secondary" type="button">Leeren</button>
+      </div>
+    </main>
+
+    <script type="module">
+      import { Room, RoomEvent, Track } from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
+
+      const BOT_IDENTITY = "qwen-asr-bot";
+      const TOPIC = "qwen-transcript";
+      const SILENT_LEVEL = 0.002;
+
+      const $ = (selector) => document.querySelector(selector);
+      const startButton = $("#start");
+      const stopButton = $("#stop");
+      const statusBadge = $("#status");
+      const botBadge = $("#bot");
+      const micSelect = $("#mic");
+      const levelMeter = $("#level");
+      const warning = $("#warning");
+      const transcript = $("#transcript");
+      const copyButton = $("#copy");
+      const clearButton = $("#clear");
+      const decoder = new TextDecoder();
+      const lines = new Map();
+      let room;
+      let meter;
+
+      function setBadge(element, text, state = "") {
+        element.textContent = text;
+        element.dataset.state = state;
+      }
+
+      const setStatus = (text, state) => setBadge(statusBadge, text, state);
+
+      function updateBotStatus() {
+        if (!room) return setBadge(botBadge, "ASR-Bot: nicht verbunden");
+        const present = [...room.remoteParticipants.values()].some((p) => p.identity === BOT_IDENTITY);
+        if (present) setBadge(botBadge, "ASR-Bot bereit", "ok");
+        else setBadge(botBadge, "ASR-Bot fehlt – Colab-Notebook starten", "warn");
+      }
+
+      async function refreshMicrophones() {
+        const devices = (await navigator.mediaDevices.enumerateDevices()).filter(
+          (device) => device.kind === "audioinput" && device.deviceId,
+        );
+        if (!devices.length) return;
+        const wanted = room?.getActiveDevice("audioinput") || micSelect.value || localStorage.getItem("micId");
+        micSelect.replaceChildren(
+          ...devices.map((device, index) => new Option(device.label || `Mikrofon ${index + 1}`, device.deviceId)),
+        );
+        if (devices.some((device) => device.deviceId === wanted)) micSelect.value = wanted;
+      }
+
+      function stopMeter() {
+        if (meter) {
+          clearInterval(meter.timer);
+          meter.context.close();
+          meter = undefined;
+        }
+        levelMeter.value = 0;
+        warning.hidden = true;
+      }
+
+      // Shows the level of the published microphone so a silent device is obvious.
+      function startMeter() {
+        stopMeter();
+        const track = room?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track?.mediaStreamTrack;
+        if (!track) return;
+        const context = new AudioContext();
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 1024;
+        context.createMediaStreamSource(new MediaStream([track])).connect(analyser);
+        const samples = new Float32Array(analyser.fftSize);
+        const startedAt = performance.now();
+        let loudest = 0;
+        const timer = setInterval(() => {
+          analyser.getFloatTimeDomainData(samples);
+          const rms = Math.sqrt(samples.reduce((sum, v) => sum + v * v, 0) / samples.length);
+          loudest = Math.max(loudest, rms);
+          levelMeter.value = Math.min(1, rms * 8);
+          warning.hidden = performance.now() - startedAt < 4000 || loudest >= SILENT_LEVEL;
+        }, 100);
+        meter = { timer, context };
+      }
+
+      // One line per utterance: interim text is replaced in place, the final text locks it.
+      function showTranscript({ type, id, text }) {
+        let line = lines.get(id);
+        if (line?.classList.contains("final")) return;
+        if (type === "final" && !text) {
+          line?.remove();
+          lines.delete(id);
+          return;
+        }
+        const atBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 48;
+        if (!line) {
+          line = document.createElement("p");
+          lines.set(id, line);
+          transcript.append(line);
+        }
+        line.textContent = text;
+        line.className = type;
+        if (atBottom) transcript.scrollTop = transcript.scrollHeight;
+      }
+
+      function onData(payload, _participant, _kind, topic) {
+        if (topic !== TOPIC) return;
+        let message;
+        try {
+          message = JSON.parse(decoder.decode(payload));
+        } catch {
+          return;
+        }
+        const valid = (message.type === "interim" || message.type === "final")
+          && typeof message.id === "string" && typeof message.text === "string";
+        if (valid) showTranscript(message);
+      }
+
+      function createRoom() {
+        const newRoom = new Room({
+          audioCaptureDefaults: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+          // No DTX and a higher bitrate keep word onsets and consonants intact for the recognizer.
+          publishDefaults: { dtx: false, red: true, audioPreset: { maxBitrate: 48_000 } },
+        });
+        newRoom
+          .on(RoomEvent.DataReceived, onData)
+          .on(RoomEvent.ParticipantConnected, updateBotStatus)
+          .on(RoomEvent.ParticipantDisconnected, updateBotStatus)
+          .on(RoomEvent.Reconnecting, () => setStatus("Verbindung unterbrochen – verbinde neu …", "warn"))
+          .on(RoomEvent.Reconnected, () => setStatus("Live – sprich Arabisch", "ok"))
+          .on(RoomEvent.MediaDevicesChanged, () => refreshMicrophones().catch(() => {}))
+          .on(RoomEvent.Disconnected, () => {
+            if (room === newRoom) teardown("Verbindung getrennt", "error");
+          });
+        return newRoom;
+      }
+
+      async function enableMicrophone() {
+        const deviceId = micSelect.value || localStorage.getItem("micId") || undefined;
+        try {
+          await room.localParticipant.setMicrophoneEnabled(true, { deviceId });
+        } catch (error) {
+          if (!deviceId) throw error;
+          localStorage.removeItem("micId");
+          await room.localParticipant.setMicrophoneEnabled(true);
+        }
+      }
+
+      async function start() {
+        startButton.disabled = true;
+        setStatus("Verbinde …", "warn");
+        try {
+          const response = await fetch("/api/session", { method: "POST" });
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            throw new Error(body.detail || `Backend-Fehler (${response.status})`);
+          }
+          const session = await response.json();
+          room = createRoom();
+          await room.connect(session.server_url, session.token);
+          updateBotStatus();
+          await enableMicrophone();
+          await refreshMicrophones();
+          startMeter();
+          stopButton.disabled = false;
+          setStatus("Live – sprich Arabisch", "ok");
+        } catch (error) {
+          await teardown(`Fehler: ${error.message}`, "error");
+        }
+      }
+
+      async function teardown(message, state) {
+        const current = room;
+        room = undefined;
+        stopMeter();
+        if (current) await current.disconnect();
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        updateBotStatus();
+        setStatus(message, state);
+      }
+
+      async function changeMicrophone() {
+        localStorage.setItem("micId", micSelect.value);
+        if (!room) return;
+        try {
+          await room.switchActiveDevice("audioinput", micSelect.value);
+          startMeter();
+        } catch (error) {
+          setStatus(`Fehler: ${error.message}`, "error");
+        }
+      }
+
+      async function copyTranscript() {
+        const text = [...transcript.querySelectorAll("p.final")].map((line) => line.textContent).join("\n");
+        if (!text) return;
+        try {
+          await navigator.clipboard.writeText(text);
+          copyButton.textContent = "Kopiert";
+        } catch {
+          copyButton.textContent = "Kopieren nicht moeglich";
+        }
+        setTimeout(() => (copyButton.textContent = "Text kopieren"), 1500);
+      }
+
+      function clearTranscript() {
+        transcript.replaceChildren();
+        lines.clear();
+      }
+
+      startButton.addEventListener("click", start);
+      stopButton.addEventListener("click", () => teardown("Beendet"));
+      micSelect.addEventListener("change", changeMicrophone);
+      copyButton.addEventListener("click", copyTranscript);
+      clearButton.addEventListener("click", clearTranscript);
+      window.addEventListener("pagehide", () => room?.disconnect());
+      refreshMicrophones().catch(() => {});
+    </script>
+  </body>
+</html>
