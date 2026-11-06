@@ -66,7 +66,7 @@ async def create_session(response: Response) -> SessionResponse:
                 room=ROOM_NAME,
                 can_publish=True,
                 can_subscribe=True,
-                can_publish_data=False,
+                    can_publish_data=True,
             )
         )
         .to_jwt()

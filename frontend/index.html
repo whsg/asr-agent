@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Qwen3 Arabisch Live-Transkription</title>
+    <title>Arabisch-Deutsch Live-Uebersetzung</title>
     <style>
       :root {
         color-scheme: light;
@@ -127,6 +127,48 @@
         padding: 9px;
       }
 
+      .audio-option {
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        margin: 0 0 20px;
+        color: #34425b;
+      }
+
+      .language-label {
+        margin: 20px 0 8px;
+        color: #4a5872;
+        font-size: 0.9rem;
+        font-weight: 600;
+      }
+
+      #translations {
+        height: 24vh;
+        min-height: 120px;
+        overflow-y: auto;
+        padding: 18px 20px;
+        border: 1px solid #e0e5ee;
+        border-radius: 10px;
+        background: #fff;
+        font-size: 1.3rem;
+        line-height: 1.7;
+        overflow-wrap: anywhere;
+      }
+
+      #translations:empty::before {
+        content: attr(data-placeholder);
+        color: #9aa3b5;
+        font-size: 1rem;
+      }
+
+      #translations p {
+        margin: 0 0 0.5em;
+      }
+
+      #audio-output audio {
+        display: none;
+      }
+
       #level {
         width: 140px;
       }
@@ -139,8 +181,8 @@
   </head>
   <body>
     <main>
-      <h1>Arabisch live transkribieren</h1>
-      <p>Sprich Arabisch. Der Text erscheint waehrend des Sprechens (grau) und wird nach einer kurzen Pause bestaetigt.</p>
+      <h1>Arabisch-Deutsch Live-Uebersetzung</h1>
+      <p>Sprich Arabisch. Der erkannte Text und die deutsche Uebersetzung erscheinen nach jeder Sprechpause.</p>
       <div class="controls">
         <button id="start" type="button">Mikrofon starten</button>
         <button id="stop" type="button" disabled>Beenden</button>
@@ -151,8 +193,13 @@
         <select id="mic" aria-label="Mikrofon"><option value="">Standard-Mikrofon</option></select>
         <meter id="level" min="0" max="1" value="0" aria-label="Mikrofon-Pegel"></meter>
       </div>
+      <label class="audio-option"><input id="audio-enabled" type="checkbox"> Deutsche Sprachausgabe (XTTS-v2)</label>
       <p id="warning" role="alert" hidden>Das Mikrofon liefert kein Signal. Waehle ein anderes Mikrofon und pruefe, dass es im System nicht stummgeschaltet ist.</p>
+      <p class="language-label">Arabisch</p>
       <div id="transcript" lang="ar" dir="rtl" aria-live="polite" data-placeholder="Der erkannte Text erscheint hier …"></div>
+      <p class="language-label">Deutsch</p>
+      <div id="translations" lang="de" dir="ltr" aria-live="polite" data-placeholder="Die deutsche Uebersetzung erscheint hier …"></div>
+      <div id="audio-output" aria-hidden="true"></div>
       <div class="controls">
         <button id="copy" class="secondary" type="button">Text kopieren</button>
         <button id="clear" class="secondary" type="button">Leeren</button>
@@ -164,6 +211,7 @@
 
       const BOT_IDENTITY = "qwen-asr-bot";
       const TOPIC = "qwen-transcript";
+      const SETTINGS_TOPIC = "qwen-settings";
       const SILENT_LEVEL = 0.002;
 
       const $ = (selector) => document.querySelector(selector);
@@ -175,10 +223,15 @@
       const levelMeter = $("#level");
       const warning = $("#warning");
       const transcript = $("#transcript");
+      const translations = $("#translations");
+      const audioEnabled = $("#audio-enabled");
+      const audioOutput = $("#audio-output");
       const copyButton = $("#copy");
       const clearButton = $("#clear");
       const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
       const lines = new Map();
+      const translationLines = new Map();
       let room;
       let meter;
 
@@ -260,6 +313,31 @@
         if (atBottom) transcript.scrollTop = transcript.scrollHeight;
       }
 
+      function showTranslation({ id, text }) {
+        let line = translationLines.get(id);
+        if (!line) {
+          line = document.createElement("p");
+          translationLines.set(id, line);
+          translations.append(line);
+        }
+        line.textContent = text;
+        translations.scrollTop = translations.scrollHeight;
+      }
+
+      function onTrackSubscribed(track, _publication, participant) {
+        if (participant.identity !== BOT_IDENTITY || track.kind !== Track.Kind.Audio) return;
+        const element = track.attach();
+        element.autoplay = true;
+        element.muted = !audioEnabled.checked;
+        audioOutput.replaceChildren(element);
+        element.play().catch(() => setStatus("Browser blockiert Audiowiedergabe", "warn"));
+      }
+
+      function onTrackUnsubscribed(track, _publication, participant) {
+        if (participant.identity !== BOT_IDENTITY) return;
+        track.detach().forEach((element) => element.remove());
+      }
+
       function onData(payload, _participant, _kind, topic) {
         if (topic !== TOPIC) return;
         let message;
@@ -268,9 +346,9 @@
         } catch {
           return;
         }
-        const valid = (message.type === "interim" || message.type === "final")
-          && typeof message.id === "string" && typeof message.text === "string";
-        if (valid) showTranscript(message);
+        if (typeof message.id !== "string" || typeof message.text !== "string") return;
+        if (message.type === "interim" || message.type === "final") showTranscript(message);
+        else if (message.type === "translation") showTranslation(message);
       }
 
       function createRoom() {
@@ -281,6 +359,8 @@
         });
         newRoom
           .on(RoomEvent.DataReceived, onData)
+          .on(RoomEvent.TrackSubscribed, onTrackSubscribed)
+          .on(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed)
           .on(RoomEvent.ParticipantConnected, updateBotStatus)
           .on(RoomEvent.ParticipantDisconnected, updateBotStatus)
           .on(RoomEvent.Reconnecting, () => setStatus("Verbindung unterbrochen – verbinde neu …", "warn"))
@@ -305,6 +385,7 @@
 
       async function start() {
         startButton.disabled = true;
+        audioEnabled.disabled = true;
         setStatus("Verbinde …", "warn");
         try {
           const response = await fetch("/api/session", { method: "POST" });
@@ -315,6 +396,10 @@
           const session = await response.json();
           room = createRoom();
           await room.connect(session.server_url, session.token);
+          await room.localParticipant.publishData(
+            encoder.encode(JSON.stringify({ type: "settings", audio_output: audioEnabled.checked })),
+            { reliable: true, topic: SETTINGS_TOPIC },
+          );
           updateBotStatus();
           await enableMicrophone();
           await refreshMicrophones();
@@ -333,6 +418,7 @@
         if (current) await current.disconnect();
         startButton.disabled = false;
         stopButton.disabled = true;
+        audioEnabled.disabled = false;
         updateBotStatus();
         setStatus(message, state);
       }
@@ -362,7 +448,9 @@
 
       function clearTranscript() {
         transcript.replaceChildren();
+        translations.replaceChildren();
         lines.clear();
+        translationLines.clear();
       }
 
       startButton.addEventListener("click", start);

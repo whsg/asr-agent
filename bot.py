@@ -14,6 +14,7 @@ import logging
 import os
 import secrets
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -31,8 +32,14 @@ logging.getLogger("livekit").setLevel(logging.WARNING)
 ROOM_NAME = os.getenv("LIVEKIT_ROOM", "qwen-asr-live")
 BOT_IDENTITY = "qwen-asr-bot"
 TOPIC = "qwen-transcript"
+SETTINGS_TOPIC = "qwen-settings"
 MODEL_NAME = os.getenv("QWEN_MODEL", "Qwen/Qwen3-ASR-1.7B")
+TRANSLATION_MODEL_NAME = os.getenv("QWEN_TRANSLATION_MODEL", "Qwen/Qwen3-8B")
 LANGUAGE = os.getenv("QWEN_LANGUAGE", "Arabic").strip() or None
+TRANSLATION_CONTEXT_SIZE = 3
+XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
+AUDIO_SAMPLE_RATE = 24_000
+AUDIO_FRAME_SAMPLES = AUDIO_SAMPLE_RATE // 50
 
 SAMPLE_RATE = 16_000
 VAD_CHUNK = 512  # Silero VAD requires exactly 32 ms windows at 16 kHz
@@ -153,21 +160,112 @@ def load_model(dtype, device_map):
     )
 
 
+def load_translator(dtype, device_map):
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    if device_map == "cpu":
+        raise RuntimeError("Qwen3-8B benoetigt fuer die Live-Uebersetzung eine GPU.")
+
+    quantization = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=dtype,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL_NAME)
+    model = AutoModelForCausalLM.from_pretrained(
+        TRANSLATION_MODEL_NAME,
+        torch_dtype=dtype,
+        quantization_config=quantization,
+        device_map="auto",
+    )
+    model.eval()
+    return model, tokenizer
+
+
+def translate_text(model, tokenizer, text: str, context: Sequence[tuple[str, str]]) -> str:
+    context_text = "\n".join(f"Arabisch: {source}\nDeutsch: {target}" for source, target in context)
+    context_block = f"\nBisheriger Gespraechskontext:\n{context_text}\n" if context_text else ""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Du bist ein professioneller Arabisch-Deutsch-Uebersetzer. "
+                "Uebersetze den aktuellen arabischen Abschnitt vollstaendig und sinngemaess "
+                "in natuerliches, gesprochenes Deutsch. Nutze den Kontext nur zur Klaerung "
+                "von Bezuengen. Erfinde nichts, fasse nicht zusammen und gib ausschliesslich "
+                "die deutsche Uebersetzung aus."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"{context_block}\nAktueller arabischer Abschnitt:\n{text}\n\nDeutsche Uebersetzung:",
+        },
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=256,
+            do_sample=False,
+            repetition_penalty=1.05,
+        )
+    generated = output[0, inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+
+class SpeechSynthesizer:
+    """Loads XTTS only when a connected client requests spoken output."""
+
+    def __init__(self) -> None:
+        self.model = None
+        self.speaker = os.getenv("XTTS_SPEAKER", "").strip() or None
+        self.speaker_wav = os.getenv("XTTS_SPEAKER_WAV", "").strip() or None
+
+    def synthesize(self, text: str) -> np.ndarray:
+        if self.speaker_wav and not Path(self.speaker_wav).is_file():
+            raise RuntimeError(f"XTTS-Sprecherdatei nicht gefunden: {self.speaker_wav}")
+        if self.model is None:
+            from TTS.api import TTS
+
+            self.model = TTS(XTTS_MODEL_NAME, gpu=torch.cuda.is_available(), progress_bar=False)
+            if not self.speaker and not self.speaker_wav:
+                speakers = self.model.speakers or []
+                if not speakers:
+                    raise RuntimeError("XTTS hat keine Standardstimme; XTTS_SPEAKER_WAV konfigurieren.")
+                self.speaker = speakers[0]
+
+        options = {"text": text, "language": "de"}
+        if self.speaker_wav:
+            options["speaker_wav"] = self.speaker_wav
+        elif self.speaker:
+            options["speaker"] = self.speaker
+        return np.asarray(self.model.tts(**options), dtype=np.float32).reshape(-1)
+
+
+def prepare_models():
+    dtype, device_map = pick_dtype()
+    logger.info("Lade ASR %s (%s auf %s)", MODEL_NAME, dtype, device_map)
+    asr_model = load_model(dtype, device_map)
+    rng = np.random.default_rng(0)
+    transcribe(asr_model, (rng.standard_normal(SAMPLE_RATE) * 0.01).astype(np.float32))
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("Lade Uebersetzer %s in 4-Bit", TRANSLATION_MODEL_NAME)
+    translator, tokenizer = load_translator(dtype, device_map)
+    load_silero_vad()
+    return asr_model, translator, tokenizer
+
+
 def transcribe(model, audio: np.ndarray) -> str:
     results = model.transcribe(audio=(audio, SAMPLE_RATE), language=LANGUAGE)
     return results[0].text.strip()
-
-
-def prepare_model():
-    dtype, device_map = pick_dtype()
-    logger.info("Lade %s (%s auf %s) - beim ersten Mal dauert der Download einige Minuten", MODEL_NAME, dtype, device_map)
-    model = load_model(dtype, device_map)
-    # Warm-up compiles the GPU kernels so the first real utterance is fast; also fails early on a broken setup.
-    rng = np.random.default_rng(0)
-    for seconds in (1, 4):
-        transcribe(model, (rng.standard_normal(seconds * SAMPLE_RATE) * 0.01).astype(np.float32))
-    load_silero_vad()
-    return model
 
 
 def ws_url(url: str) -> str:
@@ -187,7 +285,7 @@ def bot_token(key: str, secret: str) -> str:
             api.VideoGrants(
                 room_join=True,
                 room=ROOM_NAME,
-                can_publish=False,
+                can_publish=True,
                 can_subscribe=True,
                 can_publish_data=True,
             )
@@ -219,11 +317,21 @@ class Speaker:
 class Transcriber:
     """One GPU worker: finished utterances first, live updates whenever the GPU is free."""
 
-    def __init__(self, model, room: rtc.Room) -> None:
+    def __init__(self, model, translator, tokenizer, room: rtc.Room, audio_source: rtc.AudioSource) -> None:
         self.model = model
+        self.translator = translator
+        self.tokenizer = tokenizer
         self.room = room
+        self.audio_source = audio_source
+        self.speech = SpeechSynthesizer()
         self.speakers: dict[str, Speaker] = {}
         self.finals: collections.deque[tuple[str, str, np.ndarray | None]] = collections.deque()
+        self.translation_jobs: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
+        self.translation_context: collections.defaultdict[str, collections.deque[tuple[str, str]]] = (
+            collections.defaultdict(lambda: collections.deque(maxlen=TRANSLATION_CONTEXT_SIZE))
+        )
+        self.audio_enabled: dict[str, bool] = {}
+        self.gpu_lock = asyncio.Lock()
         self.wake = asyncio.Event()
 
     async def run(self) -> None:
@@ -233,6 +341,8 @@ class Transcriber:
                 identity, utterance_id, audio = self.finals.popleft()
                 text = await self._transcribe(audio) if audio is not None else ""
                 await self._send(identity, "final", utterance_id, text or "")
+                if text:
+                    await self.translation_jobs.put((identity, utterance_id, text))
                 continue
 
             speaker = self._next_interim()
@@ -246,6 +356,57 @@ class Transcriber:
             if text and utterance_id == speaker.utterance_id:
                 await self._send(speaker.identity, "interim", utterance_id, text)
 
+    async def run_translations(self) -> None:
+        while True:
+            identity, utterance_id, source_text = await self.translation_jobs.get()
+            try:
+                context = self.translation_context[identity]
+                async with self.gpu_lock:
+                    translated = await asyncio.to_thread(
+                        translate_text, self.translator, self.tokenizer, source_text, list(context)
+                    )
+                    if not translated:
+                        continue
+                    context.append((source_text, translated))
+                    await self._send(identity, "translation", utterance_id, translated)
+                    wants_audio = self.audio_enabled.get(identity, False)
+                    waveform = (
+                        await asyncio.to_thread(self.speech.synthesize, translated)
+                        if wants_audio
+                        else None
+                    )
+                if waveform is not None:
+                    await self._publish_audio(waveform)
+            except Exception:
+                logger.exception("Uebersetzung oder Sprachausgabe fuer %s fehlgeschlagen", identity)
+            finally:
+                self.translation_jobs.task_done()
+
+    async def _publish_audio(self, waveform: np.ndarray) -> None:
+        samples = (np.clip(np.nan_to_num(waveform), -1.0, 1.0) * 32767).astype(np.int16)
+        for offset in range(0, len(samples), AUDIO_FRAME_SAMPLES):
+            frame_samples = np.ascontiguousarray(samples[offset:offset + AUDIO_FRAME_SAMPLES])
+            if frame_samples.size == 0:
+                continue
+            frame = rtc.AudioFrame(
+                data=frame_samples.tobytes(),
+                sample_rate=AUDIO_SAMPLE_RATE,
+                num_channels=1,
+                samples_per_channel=frame_samples.size,
+            )
+            await self.audio_source.capture_frame(frame)
+
+    def on_data(self, packet: rtc.DataPacket) -> None:
+        if packet.topic != SETTINGS_TOPIC or packet.participant is None:
+            return
+        try:
+            message = json.loads(packet.data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        enabled = message.get("audio_output")
+        if message.get("type") == "settings" and isinstance(enabled, bool):
+            self.audio_enabled[packet.participant.identity] = enabled
+
     def _next_interim(self) -> Speaker | None:
         candidates = [
             s for s in self.speakers.values()
@@ -257,7 +418,8 @@ class Transcriber:
 
     async def _transcribe(self, audio: np.ndarray) -> str | None:
         try:
-            return await asyncio.to_thread(transcribe, self.model, audio)
+            async with self.gpu_lock:
+                return await asyncio.to_thread(transcribe, self.model, audio)
         except Exception:
             logger.exception("Transkription fehlgeschlagen")
             return None
@@ -297,10 +459,12 @@ class Transcriber:
             logger.info("%s beendet", identity)
 
 
-async def run_room(model, url: str, key: str, secret: str) -> None:
+async def run_room(model, translator, tokenizer, url: str, key: str, secret: str) -> None:
     room = rtc.Room()
-    transcriber = Transcriber(model, room)
+    audio_source = rtc.AudioSource(sample_rate=AUDIO_SAMPLE_RATE, num_channels=1, queue_size_ms=3000)
+    transcriber = Transcriber(model, translator, tokenizer, room, audio_source)
     worker = asyncio.create_task(transcriber.run())
+    translation_worker = asyncio.create_task(transcriber.run_translations())
     listeners: dict[str, asyncio.Task] = {}
     disconnected = asyncio.Event()
 
@@ -318,21 +482,26 @@ async def run_room(model, url: str, key: str, secret: str) -> None:
 
     room.on("track_subscribed", lambda track, _pub, participant: start_listening(track, participant))
     room.on("track_unsubscribed", lambda track, _pub, _participant: stop_listening(track))
+    room.on("data_received", transcriber.on_data)
     room.on("disconnected", lambda *_: disconnected.set())
 
-    await room.connect(ws_url(url), bot_token(key, secret))
-    logger.info("BEREIT: Bot ist im Raum '%s'. Jetzt die Web-App oeffnen und das Mikrofon starten.", ROOM_NAME)
-    for participant in room.remote_participants.values():
-        for publication in participant.track_publications.values():
-            if publication.track is not None:
-                start_listening(publication.track, participant)
     try:
+        await room.connect(ws_url(url), bot_token(key, secret))
+        audio_track = rtc.LocalAudioTrack.create_audio_track("german-translation", audio_source)
+        await room.local_participant.publish_track(audio_track)
+        logger.info("BEREIT: Bot ist im Raum '%s'. Jetzt die Web-App oeffnen und das Mikrofon starten.", ROOM_NAME)
+        for participant in room.remote_participants.values():
+            for publication in participant.track_publications.values():
+                if publication.track is not None:
+                    start_listening(publication.track, participant)
         await disconnected.wait()
     finally:
-        for task in list(listeners.values()):
+        tasks = [*listeners.values(), worker, translation_worker]
+        for task in tasks:
             task.cancel()
-        worker.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await room.disconnect()
+        await audio_source.aclose()
 
 
 async def main() -> None:
@@ -350,10 +519,10 @@ async def main() -> None:
         raise SystemExit(f"LiveKit lehnt die Zugangsdaten ab oder ist nicht erreichbar: {exc}")
     logger.info("LiveKit-Zugangsdaten sind gueltig.")
 
-    model = await asyncio.to_thread(prepare_model)
+    model, translator, tokenizer = await asyncio.to_thread(prepare_models)
     while True:
         try:
-            await run_room(model, url, key, secret)
+            await run_room(model, translator, tokenizer, url, key, secret)
             logger.warning("Verbindung beendet, verbinde neu ...")
         except Exception:
             logger.exception("Verbindungsfehler, neuer Versuch in 5 Sekunden")
