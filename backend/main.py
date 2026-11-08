@@ -16,7 +16,7 @@ if not ENV_FILE.exists():
     ENV_FILE = PROJECT_ROOT.parent / ".env"
 load_dotenv(ENV_FILE)
 
-ROOM_NAME = os.getenv("LIVEKIT_ROOM", "qwen-asr-live")
+ROOM_NAME = os.getenv("LIVEKIT_ROOM", "arabic-asr-live")
 
 
 class SessionResponse(BaseModel):
@@ -35,7 +35,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Qwen3 Arabic Live Transcription and Translation", lifespan=lifespan)
+app = FastAPI(title="Arabic Live Transcription and Translation", lifespan=lifespan)
 
 
 def to_ws_url(url: str) -> str:

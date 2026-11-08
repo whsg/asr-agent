@@ -1,14 +1,11 @@
-"""Arabic live transcription bot with selectable ASR backends (Qwen3-ASR, Cohere Transcribe Arabic).
+"""Arabic live transcription bot using Cohere Transcribe Arabic.
 
-Joins a LiveKit room, transcribes the audio of every other participant with each
-enabled backend (env ASR_BACKENDS: "qwen", "cohere" or "qwen,cohere") and sends
+Joins a LiveKit room, transcribes the audio of every other participant and sends
 the text back to the speaker as data messages:
 
   topic "<backend>-transcript": {"type": "interim" | "final", "id": str, "text": str}
 
-Finished utterances of the backend the speaker picked in the web app (default
-Qwen) are additionally translated to German by the translation model chosen via
-env TRANSLATION_BACKEND ("translategemma" or "qwen3"); only one is loaded:
+Finished utterances are translated to German with TranslateGemma:
 
   topic "asr-translation": {"type": "translation", "id": str, "text": str}
 
@@ -28,7 +25,6 @@ import os
 import secrets
 import sys
 import urllib.request
-from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -40,39 +36,18 @@ from silero_vad import load_silero_vad
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
-logger = logging.getLogger("qwen-bot")
+logger = logging.getLogger("asr-bot")
 logging.getLogger("livekit").setLevel(logging.WARNING)
 
-ROOM_NAME = os.getenv("LIVEKIT_ROOM", "qwen-asr-live")
-BOT_IDENTITY = "qwen-asr-bot"
-SETTINGS_TOPIC = "qwen-settings"
+ROOM_NAME = os.getenv("LIVEKIT_ROOM", "arabic-asr-live")
+BOT_IDENTITY = "arabic-asr-bot"
+SETTINGS_TOPIC = "asr-settings"
 TRANSLATION_TOPIC = "asr-translation"
-TOPIC_BY_BACKEND = {"qwen": "qwen-transcript", "cohere": "cohere-transcript"}
-
-
-def _parse_backends() -> tuple[str, ...]:
-    raw = os.getenv("ASR_BACKENDS", "qwen")
-    names = [part.strip().lower() for part in raw.replace(";", ",").split(",") if part.strip()]
-    valid = [name for name in dict.fromkeys(names) if name in TOPIC_BY_BACKEND]
-    return tuple(valid) or ("qwen",)
-
-
-ASR_BACKENDS = _parse_backends()
-MODEL_NAME = os.getenv("QWEN_MODEL", "Qwen/Qwen3-ASR-1.7B")
+TOPIC_BY_BACKEND = {"cohere": "cohere-transcript"}
 COHERE_MODEL_NAME = os.getenv("COHERE_MODEL", "CohereLabs/cohere-transcribe-arabic-07-2026")
 COHERE_4BIT = os.getenv("COHERE_4BIT", "").strip().lower() in ("1", "true", "yes", "on")
 COHERE_LANGUAGE = os.getenv("COHERE_LANGUAGE", "ar").strip() or "ar"
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
-LANGUAGE = os.getenv("QWEN_LANGUAGE", "Arabic").strip() or None
-TRANSLATION_CONTEXT_SIZE = 3
-# Translation backend: exactly ONE of these is loaded at startup (never both).
-#   "translategemma" -> google/translategemma-12b-it (default)
-#   "qwen3"          -> Qwen/Qwen3-8B
-TRANSLATION_BACKEND = os.getenv("TRANSLATION_BACKEND", "translategemma").strip().lower()
-if TRANSLATION_BACKEND not in ("translategemma", "qwen3"):
-    logger.warning("Invalid TRANSLATION_BACKEND=%r; using 'translategemma' instead", TRANSLATION_BACKEND)
-    TRANSLATION_BACKEND = "translategemma"
-QWEN_TRANSLATION_MODEL = os.getenv("QWEN_TRANSLATION_MODEL", "Qwen/Qwen3-8B")
 GEMMA_TRANSLATION_MODEL = os.getenv("GEMMA_TRANSLATION_MODEL", "google/translategemma-12b-it")
 TRANSLATION_SOURCE_LANG = os.getenv("TRANSLATION_SOURCE_LANG", "ar").strip() or "ar"
 TRANSLATION_TARGET_LANG = os.getenv("TRANSLATION_TARGET_LANG", "de").strip() or "de"
@@ -249,18 +224,6 @@ def pick_dtype():
     return (torch.bfloat16 if major >= 8 else torch.float16), "cuda:0"
 
 
-def load_model(dtype, device_map):
-    from qwen_asr import Qwen3ASRModel
-
-    return Qwen3ASRModel.from_pretrained(
-        MODEL_NAME,
-        dtype=dtype,
-        device_map=device_map,
-        max_inference_batch_size=1,
-        max_new_tokens=256,
-    )
-
-
 def load_cohere(dtype):
     """Loads Cohere Transcribe Arabic (gated repo, needs transformers>=5.4.0)."""
     from transformers import AutoProcessor, CohereAsrForConditionalGeneration
@@ -290,7 +253,7 @@ def load_cohere(dtype):
         raise RuntimeError(
             "Could not load the Cohere model: "
             f"{exc}. The repo is gated: accept the terms on huggingface.co and "
-            "set HF_TOKEN in the .env, or remove 'cohere' from ASR_BACKENDS."
+            "set HF_TOKEN in the .env."
         ) from exc
     model.eval()
     return processor, model
@@ -328,18 +291,6 @@ class AsrBackend:
             return None
 
 
-class QwenBackend(AsrBackend):
-    name = "qwen"
-
-    def __init__(self, gpu_lock: asyncio.Lock, model) -> None:
-        super().__init__(gpu_lock)
-        self.model = model
-
-    def transcribe_sync(self, audio: np.ndarray) -> str:
-        results = self.model.transcribe(audio=(audio, SAMPLE_RATE), language=LANGUAGE)
-        return results[0].text.strip()
-
-
 class CohereBackend(AsrBackend):
     name = "cohere"
 
@@ -363,28 +314,6 @@ def _bits_and_bytes_4bit(dtype):
     )
 
 
-def load_qwen_translator(dtype, device_map):
-    """Loads Qwen3-8B (4-bit); supports conversation context for reference resolution."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    if device_map == "cpu":
-        raise RuntimeError("Qwen3-8B requires a GPU for live translation.")
-
-    load_kwargs = {}
-    if HF_TOKEN:
-        load_kwargs["token"] = HF_TOKEN
-    tokenizer = AutoTokenizer.from_pretrained(QWEN_TRANSLATION_MODEL, **load_kwargs)
-    model = AutoModelForCausalLM.from_pretrained(
-        QWEN_TRANSLATION_MODEL,
-        torch_dtype=dtype,
-        quantization_config=_bits_and_bytes_4bit(dtype),
-        device_map="auto",
-        **load_kwargs,
-    )
-    model.eval()
-    return model, tokenizer
-
-
 def load_translategemma(dtype, device_map):
     """Loads TranslateGemma 12B (4-bit) for direct text translation (gated repo)."""
     from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -403,46 +332,8 @@ def load_translategemma(dtype, device_map):
     return model, processor
 
 
-def _translate_text_qwen(model, tokenizer, text: str, context: Sequence[tuple[str, str]]) -> str:
-    context_text = "\n".join(f"Arabic: {source}\nGerman: {target}" for source, target in context)
-    context_block = f"\nConversation context so far:\n{context_text}\n" if context_text else ""
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a professional Arabic-to-German translator. "
-                "Translate the current Arabic segment completely and faithfully "
-                "into natural, spoken German. Use the context only to resolve "
-                "references. Do not invent anything, do not summarize, and output "
-                "only the German translation."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"{context_block}\nCurrent Arabic segment:\n{text}\n\nGerman translation:",
-        },
-    ]
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    with torch.inference_mode():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            do_sample=False,
-            repetition_penalty=1.05,
-        )
-    generated = output[0, inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(generated, skip_special_tokens=True).strip()
-
-
-def _translate_text_translategemma(model, processor, text: str, context: Sequence[tuple[str, str]]) -> str:
-    # TranslateGemma uses a fixed chat template: one user turn carrying the
-    # source/target language codes and the text only. No conversation context.
+def _translate_text_translategemma(model, processor, text: str) -> str:
+    # TranslateGemma uses one user turn carrying the language codes and text.
     messages = [
         {
             "role": "user",
@@ -470,11 +361,8 @@ def _translate_text_translategemma(model, processor, text: str, context: Sequenc
     return processor.decode(generated, skip_special_tokens=True).strip()
 
 
-def translate_text(model, tokenizer, text: str, context: Sequence[tuple[str, str]]) -> str:
-    """Dispatches to the loaded translation backend (see TRANSLATION_BACKEND)."""
-    if TRANSLATION_BACKEND == "translategemma":
-        return _translate_text_translategemma(model, tokenizer, text, context)
-    return _translate_text_qwen(model, tokenizer, text, context)
+def translate_text(model, processor, text: str) -> str:
+    return _translate_text_translategemma(model, processor, text)
 
 
 class SpeechSynthesizer:
@@ -606,30 +494,17 @@ class F5Synthesizer:
 
 def prepare_models():
     dtype, device_map = pick_dtype()
-    models: dict[str, object] = {}
     rng = np.random.default_rng(0)
     warmup = (rng.standard_normal(SAMPLE_RATE) * 0.01).astype(np.float32)
-    if "qwen" in ASR_BACKENDS:
-        logger.info("Loading ASR %s (%s on %s)", MODEL_NAME, dtype, device_map)
-        asr_model = load_model(dtype, device_map)
-        asr_model.transcribe(audio=(warmup, SAMPLE_RATE), language=LANGUAGE)  # Warm-up
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        models["qwen"] = asr_model
-    if "cohere" in ASR_BACKENDS:
-        logger.info("Loading Cohere ASR %s%s", COHERE_MODEL_NAME, " (4-bit)" if COHERE_4BIT else "")
-        models["cohere"] = load_cohere(dtype)
-        cohere_transcribe(*models["cohere"])  # Warm-up
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    if TRANSLATION_BACKEND == "translategemma":
-        logger.info("Loading translator %s in 4-bit", GEMMA_TRANSLATION_MODEL)
-        translator, tokenizer = load_translategemma(dtype, device_map)
-    else:
-        logger.info("Loading translator %s in 4-bit", QWEN_TRANSLATION_MODEL)
-        translator, tokenizer = load_qwen_translator(dtype, device_map)
+    logger.info("Loading Cohere ASR %s%s", COHERE_MODEL_NAME, " (4-bit)" if COHERE_4BIT else "")
+    models = {"cohere": load_cohere(dtype)}
+    cohere_transcribe(*models["cohere"], warmup)  # Warm-up
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("Loading TranslateGemma %s in 4-bit", GEMMA_TRANSLATION_MODEL)
+    translator, processor = load_translategemma(dtype, device_map)
     load_silero_vad()
-    return models, translator, tokenizer
+    return models, translator, processor
 
 
 def ws_url(url: str) -> str:
@@ -690,22 +565,17 @@ class _PipelineState:
 class Transcriber:
     """Shared VAD plus one worker per ASR backend: finished utterances first, live updates in between."""
 
-    def __init__(self, backends: dict[str, AsrBackend], translator, tokenizer, room: rtc.Room, audio_source: rtc.AudioSource) -> None:
+    def __init__(self, backends: dict[str, AsrBackend], translator, processor, room: rtc.Room, audio_source: rtc.AudioSource) -> None:
         self.backends = backends
         self.pipelines: dict[str, _PipelineState] = {name: _PipelineState() for name in backends}
         self.translator = translator
-        self.tokenizer = tokenizer
+        self.processor = processor
         self.room = room
         self.audio_source = audio_source
         self.speech = SpeechSynthesizer()
         self.speakers: dict[str, Speaker] = {}
         self.translation_jobs: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
-        self.translation_context: collections.defaultdict[str, collections.deque[tuple[str, str]]] = (
-            collections.defaultdict(lambda: collections.deque(maxlen=TRANSLATION_CONTEXT_SIZE))
-        )
         self.audio_enabled: dict[str, bool] = {}
-        self.translation_source: dict[str, str] = {}
-        self.default_translation_source = "qwen" if "qwen" in backends else next(iter(backends))
         self.gpu_lock = next(iter(backends.values())).gpu_lock
 
     async def run_pipeline(self, name: str) -> None:
@@ -717,7 +587,7 @@ class Transcriber:
                 identity, utterance_id, audio = state.finals.popleft()
                 text = await self.backends[name].transcribe(audio) if audio is not None else ""
                 await self._send(identity, "final", utterance_id, text or "", topic)
-                if text and self._effective_translation_source(identity) == name:
+                if text:
                     await self.translation_jobs.put((identity, utterance_id, text))
                 continue
 
@@ -736,14 +606,12 @@ class Transcriber:
         while True:
             identity, utterance_id, source_text = await self.translation_jobs.get()
             try:
-                context = self.translation_context[identity]
                 async with self.gpu_lock:
                     translated = await asyncio.to_thread(
-                        translate_text, self.translator, self.tokenizer, source_text, list(context)
+                        translate_text, self.translator, self.processor, source_text
                     )
                     if not translated:
                         continue
-                    context.append((source_text, translated))
                     await self._send(identity, "translation", utterance_id, translated, TRANSLATION_TOPIC)
                     wants_audio = self.audio_enabled.get(identity, False)
                     waveform = (
@@ -785,16 +653,6 @@ class Transcriber:
         enabled = message.get("audio_output")
         if isinstance(enabled, bool):
             self.audio_enabled[identity] = enabled
-        source = message.get("translation_asr")
-        if isinstance(source, str) and source in self.backends:
-            self.translation_source[identity] = source
-        # Tell the client which backends are actually loaded in this bot.
-        capabilities = {
-            "type": "capabilities",
-            "backends": list(self.backends),
-            "default_translation_asr": self.default_translation_source,
-        }
-        asyncio.create_task(self._publish(identity, capabilities, SETTINGS_TOPIC))
 
     def _next_interim(self, name: str) -> Speaker | None:
         state = self.pipelines[name]
@@ -809,9 +667,6 @@ class Transcriber:
             key=lambda s: s.segmenter.size - state.interim_sizes.get(s.identity, 0),
             default=None,
         )
-
-    def _effective_translation_source(self, identity: str) -> str:
-        return self.translation_source.get(identity) or self.default_translation_source
 
     async def _publish(self, identity: str, payload: dict, topic: str) -> None:
         try:
@@ -858,17 +713,13 @@ class Transcriber:
             logger.info("%s finished", identity)
 
 
-async def run_room(models, translator, tokenizer, url: str, key: str, secret: str) -> None:
+async def run_room(models, translator, processor, url: str, key: str, secret: str) -> None:
     room = rtc.Room()
     audio_source = rtc.AudioSource(sample_rate=AUDIO_SAMPLE_RATE, num_channels=1, queue_size_ms=3000)
     gpu_lock = asyncio.Lock()
-    backends: dict[str, AsrBackend] = {}
-    if "qwen" in models:
-        backends["qwen"] = QwenBackend(gpu_lock, models["qwen"])
-    if "cohere" in models:
-        processor, cohere_model = models["cohere"]
-        backends["cohere"] = CohereBackend(gpu_lock, processor, cohere_model)
-    transcriber = Transcriber(backends, translator, tokenizer, room, audio_source)
+    processor, cohere_model = models["cohere"]
+    backends = {"cohere": CohereBackend(gpu_lock, processor, cohere_model)}
+    transcriber = Transcriber(backends, translator, processor, room, audio_source)
     pipeline_workers = [asyncio.create_task(transcriber.run_pipeline(name)) for name in backends]
     translation_worker = asyncio.create_task(transcriber.run_translations())
     listeners: dict[str, asyncio.Task] = {}
@@ -928,8 +779,8 @@ async def main() -> None:
     except Exception as exc:
         raise SystemExit(f"LiveKit rejected the credentials or is not reachable: {exc}")
     logger.info("LiveKit credentials are valid.")
-    logger.info("ASR backends: %s", ", ".join(ASR_BACKENDS))
-    logger.info("Translation backend: %s", TRANSLATION_BACKEND)
+    logger.info("ASR model: %s", COHERE_MODEL_NAME)
+    logger.info("Translation model: %s", GEMMA_TRANSLATION_MODEL)
     if TTS_BACKEND == "f5":
         if not F5_REF_WAV or not F5_REF_TEXT:
             logger.warning(
@@ -942,15 +793,13 @@ async def main() -> None:
     else:
         logger.info("TTS backend: xtts")
     logger.info("Max utterance length: %.2f s", MAX_UTTERANCE_SECONDS)
-    if "cohere" in ASR_BACKENDS and not HF_TOKEN:
+    if not HF_TOKEN:
         logger.warning("Cohere ASR is enabled but HF_TOKEN is missing - the repo is gated, so loading will fail.")
-    if TRANSLATION_BACKEND == "translategemma" and not HF_TOKEN:
-        logger.warning("TranslateGemma is enabled but HF_TOKEN is missing - the repo is gated, so loading will fail.")
 
-    models, translator, tokenizer = await asyncio.to_thread(prepare_models)
+    models, translator, processor = await asyncio.to_thread(prepare_models)
     while True:
         try:
-            await run_room(models, translator, tokenizer, url, key, secret)
+            await run_room(models, translator, processor, url, key, secret)
             logger.warning("Connection ended, reconnecting ...")
         except Exception:
             logger.exception("Connection error, retrying in 5 seconds")

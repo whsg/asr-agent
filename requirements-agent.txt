@@ -7,7 +7,6 @@ accelerate
 coqui-tts>=0.27
 numpy>=1.26
 python-dotenv>=1.0
-qwen-asr>=0.0.6
 silero-vad>=5.1
 torch
 huggingface_hub

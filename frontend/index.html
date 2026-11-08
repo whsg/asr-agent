@@ -125,26 +125,12 @@
         align-items: start;
       }
 
-      .panes.both {
-        grid-template-columns: 1fr 1fr;
-      }
-
-      @media (max-width: 700px) {
-        .panes.both {
-          grid-template-columns: 1fr;
-        }
-      }
-
       .pane-caption {
-        display: none;
+        display: block;
         margin: 0 0 6px;
         color: #4a5872;
         font-size: 0.9rem;
         font-weight: 600;
-      }
-
-      .panes.both .pane-caption {
-        display: block;
       }
 
       .asr-text {
@@ -255,25 +241,11 @@
         <meter id="level" min="0" max="1" value="0" aria-label="Microphone level"></meter>
       </div>
       <label class="audio-option"><input id="audio-enabled" type="checkbox"> German speech output</label>
-      <div class="asr-modes">
-        <span class="asr-modes-label">ASR model:</span>
-        <label class="option"><input type="radio" name="asr" value="qwen" checked> Qwen3-ASR</label>
-        <label class="option"><input type="radio" name="asr" value="cohere"> Cohere Transcribe Arabic</label>
-        <label class="option"><input type="radio" name="asr" value="both"> Side by side</label>
-        <span id="trans-source" class="option-group hidden">
-          <span>Translate from:</span>
-          <label class="option"><input type="radio" name="trans" value="qwen" checked> Qwen</label>
-          <label class="option"><input type="radio" name="trans" value="cohere"> Cohere</label>
-        </span>
-      </div>
+      <p class="asr-modes-label">ASR model: Cohere Transcribe Arabic</p>
       <p id="warning" role="alert" hidden>The microphone is not producing a signal. Choose a different microphone and make sure it is not muted in the system.</p>
       <p class="language-label">Arabic</p>
       <div id="panes" class="panes">
-        <div class="pane" id="pane-qwen">
-          <p class="pane-caption">Qwen3-ASR</p>
-          <div id="transcript-qwen" class="asr-text" lang="ar" dir="rtl" aria-live="polite" data-placeholder="Recognized text appears here ..."></div>
-        </div>
-        <div class="pane hidden" id="pane-cohere">
+        <div class="pane" id="pane-cohere">
           <p class="pane-caption">Cohere Transcribe Arabic</p>
           <div id="transcript-cohere" class="asr-text" lang="ar" dir="rtl" aria-live="polite" data-placeholder="Recognized text appears here ..."></div>
         </div>
@@ -290,11 +262,10 @@
     <script type="module">
       import { Room, RoomEvent, Track } from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
 
-      const BOT_IDENTITY = "qwen-asr-bot";
-      const TOPIC_QWEN = "qwen-transcript";
+      const BOT_IDENTITY = "arabic-asr-bot";
       const TOPIC_COHERE = "cohere-transcript";
       const TRANSLATION_TOPIC = "asr-translation";
-      const SETTINGS_TOPIC = "qwen-settings";
+      const SETTINGS_TOPIC = "asr-settings";
       const SILENT_LEVEL = 0.002;
 
       const $ = (selector) => document.querySelector(selector);
@@ -314,15 +285,7 @@
       const encoder = new TextEncoder();
       const translationLines = new Map();
 
-      const PANES = {
-        qwen: { label: "Qwen3-ASR", element: $("#transcript-qwen"), lines: new Map() },
-        cohere: { label: "Cohere Transcribe Arabic", element: $("#transcript-cohere"), lines: new Map() },
-      };
-      const panesWrap = $("#panes");
-      const paneEls = { qwen: $("#pane-qwen"), cohere: $("#pane-cohere") };
-      const modeRadios = [...document.querySelectorAll('input[name="asr"]')];
-      const transRadios = [...document.querySelectorAll('input[name="trans"]')];
-      const transSourceBox = $("#trans-source");
+      const transcriptPane = { element: $("#transcript-cohere"), lines: new Map() };
       let room;
       let meter;
 
@@ -385,8 +348,8 @@
       }
 
       // One line per utterance: interim text is replaced in place, the final text locks it.
-      function showTranscript(backend, { type, id, text }) {
-        const pane = PANES[backend];
+      function showTranscript({ type, id, text }) {
+        const pane = transcriptPane;
         let line = pane.lines.get(id);
         if (line?.classList.contains("final")) return;
         if (type === "final" && !text) {
@@ -437,18 +400,14 @@
         } catch {
           return;
         }
-        if (topic === SETTINGS_TOPIC) {
-          applyCapabilities(message);
-          return;
-        }
         if (message.type === "translation") {
           if (topic === TRANSLATION_TOPIC) showTranslation(message);
           return;
         }
-        if (topic !== TOPIC_QWEN && topic !== TOPIC_COHERE) return;
+        if (topic !== TOPIC_COHERE) return;
         if (message.type !== "interim" && message.type !== "final") return;
         if (typeof message.id !== "string" || typeof message.text !== "string") return;
-        showTranscript(topic === TOPIC_QWEN ? "qwen" : "cohere", message);
+        showTranscript(message);
       }
 
       function createRoom() {
@@ -532,17 +491,11 @@
       }
 
       async function copyTranscript() {
-        const names = getMode() === "both" ? ["qwen", "cohere"] : [getMode()];
-        const text = names
-          .map((name) => {
-            const finals = [...PANES[name].lines.values()]
-              .filter((line) => line.classList.contains("final"))
-              .map((line) => line.textContent)
-              .filter(Boolean);
-            return finals.length ? [`${PANES[name].label}:`, ...finals].join("\n") : "";
-          })
+        const text = [...transcriptPane.lines.values()]
+          .filter((line) => line.classList.contains("final"))
+          .map((line) => line.textContent)
           .filter(Boolean)
-          .join("\n\n");
+          .join("\n");
         if (!text) return;
         try {
           await navigator.clipboard.writeText(text);
@@ -554,33 +507,10 @@
       }
 
       function clearTranscript() {
-        for (const pane of Object.values(PANES)) {
-          pane.element.replaceChildren();
-          pane.lines.clear();
-        }
+        transcriptPane.element.replaceChildren();
+        transcriptPane.lines.clear();
         translations.replaceChildren();
         translationLines.clear();
-      }
-
-      function getMode() {
-        return modeRadios.find((radio) => radio.checked)?.value || "qwen";
-      }
-
-      function getTranslationAsr() {
-        return getMode() === "both"
-          ? transRadios.find((radio) => radio.checked)?.value || "qwen"
-          : getMode();
-      }
-
-      function applyMode() {
-        const mode = getMode();
-        panesWrap.classList.toggle("both", mode === "both");
-        for (const name of Object.keys(PANES)) {
-          paneEls[name].classList.toggle("hidden", mode !== "both" && mode !== name);
-        }
-        transSourceBox.classList.toggle("hidden", mode !== "both");
-        localStorage.setItem("asrMode", mode);
-        localStorage.setItem("translationAsr", getTranslationAsr());
       }
 
       function sendSettings() {
@@ -590,44 +520,11 @@
             JSON.stringify({
               type: "settings",
               audio_output: audioEnabled.checked,
-              translation_asr: getTranslationAsr(),
             }),
           ),
           { reliable: true, topic: SETTINGS_TOPIC },
         );
       }
-
-      // The bot answers settings messages with the backends it actually has loaded.
-      function applyCapabilities(message) {
-        if (!message || message.type !== "capabilities") return;
-        const loaded = new Set(message.backends || []);
-        if (!loaded.size) return;
-        for (const radio of modeRadios) {
-          radio.disabled = radio.value === "both" ? loaded.size < 2 : !loaded.has(radio.value);
-        }
-        for (const radio of transRadios) radio.disabled = !loaded.has(radio.value);
-        const fallback = loaded.has("qwen") ? "qwen" : [...loaded][0] || "qwen";
-        const mode = getMode();
-        if (mode !== "both" && !loaded.has(mode)) {
-          modeRadios.find((radio) => radio.value === fallback)?.click();
-        }
-        if (getMode() === "both" && !loaded.has(getTranslationAsr())) {
-          transRadios.find((radio) => radio.value === fallback)?.click();
-        }
-        sendSettings();
-      }
-
-      for (const radio of [...modeRadios, ...transRadios]) {
-        radio.addEventListener("change", () => {
-          applyMode();
-          sendSettings();
-        });
-      }
-
-      // Restore the last chosen ASR mode from a previous session.
-      modeRadios.find((radio) => radio.value === localStorage.getItem("asrMode"))?.click();
-      transRadios.find((radio) => radio.value === localStorage.getItem("translationAsr"))?.click();
-      applyMode();
 
       startButton.addEventListener("click", start);
       stopButton.addEventListener("click", () => teardown("Stopped"));

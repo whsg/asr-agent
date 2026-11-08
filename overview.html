@@ -68,12 +68,9 @@
       <p>
         A browser mic client streams speech over <strong>LiveKit</strong> to a GPU bot on
         <strong>Google Colab</strong>. The bot cuts the audio into sentences with a shared
-        Silero-VAD segmenter and transcribes every utterance with one or two selectable ASR
-        backends &mdash; <strong>Qwen3-ASR-1.7B</strong> and
-        <strong>Cohere Transcribe Arabic</strong> (chosen via the <code>ASR_BACKENDS</code>
-        env var). The text of the backend you pick in the web app is translated to German by a
-        selectable translation model &mdash; <strong>TranslateGemma-12B</strong> (default) or
-        <strong>Qwen3-8B</strong> (chosen via <code>TRANSLATION_BACKEND</code>, only one loaded)
+        Silero-VAD segmenter and transcribes every utterance with
+        <strong>Cohere Transcribe Arabic</strong>. The Arabic text is translated to German by
+        <strong>TranslateGemma-12B</strong>,
         &mdash; and the transcripts (plus optional German speech) are sent back to the browser in
         near real time.
       </p>
@@ -81,7 +78,7 @@
       <div class="grid">
         <div class="card">
           <h3>🖥 Your PC</h3>
-          <p>FastAPI server (<code>backend/main.py</code>) + web client (<code>frontend/index.html</code>). Sends the mic and a LiveKit token; renders the transcript in three display modes (Qwen, Cohere, or both side by side) and remembers the settings in <code>localStorage</code>.</p>
+          <p>FastAPI server (<code>backend/main.py</code>) + web client (<code>frontend/index.html</code>). Sends the mic and a LiveKit token; renders the Cohere transcript.</p>
         </div>
         <div class="card">
           <h3>☁ LiveKit Cloud</h3>
@@ -89,7 +86,7 @@
         </div>
         <div class="card">
           <h3>🤖 Colab (T4 GPU)</h3>
-          <p><code>bot.py</code>: shared Silero VAD + selectable ASR backends (<code>ASR_BACKENDS</code>: <code>qwen</code>, <code>cohere</code>, or <code>qwen,cohere</code>) + a selectable 4-bit translator (<code>TRANSLATION_BACKEND</code>: <code>translategemma</code> 12B (default) or <code>qwen3</code> 8B &mdash; only one loaded) + F5-TTS spoken output (default, <code>TTS_BACKEND=f5</code> &mdash; uses the German fine-tune <code>aihpi/F5-TTS-German</code>); <code>TTS_BACKEND=xtts</code> falls back to XTTS-v2. One async worker per enabled backend, all GPU work behind a single shared lock.</p>
+          <p><code>bot.py</code>: shared Silero VAD + Cohere ASR + 4-bit TranslateGemma + optional F5-TTS spoken output (German fine-tune <code>aihpi/F5-TTS-German</code>); <code>TTS_BACKEND=xtts</code> selects XTTS-v2 instead.</p>
         </div>
       </div>
 
@@ -97,27 +94,23 @@
       <div class="mermaid">
         flowchart LR
           subgraph PC["Your PC"]
-            MIC["Microphone"] --> WK["Web client<br/>frontend/index.html<br/>3 display modes + settings"]
+            MIC["Microphone"] --> WK["Web client<br/>frontend/index.html<br/>Cohere transcript"]
             WK <--> BK["FastAPI server<br/>backend/main.py"]
           end
           subgraph LK["LiveKit Cloud"]
             RT["Audio room"]
           end
-          subgraph COL["Colab GPU<br/>ASR_BACKENDS picks the backend(s)"]
+          subgraph COL["Colab GPU"]
             SEGC["Silero VAD<br/>shared sentence splitter"]
-            ASRQ["Qwen3-ASR-1.7B<br/>qwen-transcript"]
             ASRC["Cohere Transcribe Arabic<br/>cohere-transcript"]
-            TR["Translator (4-bit)<br/>translategemma-12b-it (default)<br/>or qwen3-8b"]
+            TR["TranslateGemma (4-bit)"]
             TTS["F5-TTS (default), XTTS-v2 fallback<br/>German speech (opt.)"]
-            SEGC --> ASRQ
             SEGC --> ASRC
-            ASRQ -->|final of the user-selected backend| TR
-            ASRC -->|final of the user-selected backend| TR
+            ASRC --> TR
             TR --> TTS
           end
           MIC -->|audio track| RT
           RT -->|PCM per speaker| SEGC
-          ASRQ -->|data: interim/final| RT
           ASRC -->|data: interim/final| RT
           TR -->|data: asr-translation| RT
           TTS -->|audio frames| RT
@@ -126,8 +119,7 @@
 
       <h2>What the bot does with each sentence</h2>
       <p>
-        The Silero-VAD segmentation runs once per speaker and feeds every enabled backend. Each
-        backend has its own async transcription worker and its own LiveKit topic; all GPU work
+        The Silero-VAD segmentation runs once per speaker and feeds Cohere. All GPU work
         (transcription, translation, TTS) is serialized through one shared lock, and finished
         utterances are always processed before live interim updates.
       </p>
@@ -135,26 +127,21 @@
         flowchart TD
           A["Raw 16 kHz audio (one shared VAD per speaker)"] --> B{"Silero VAD<br/>start / end of speech?"}
           B -->|"gap &gt; 0.55 s"| C["Finished utterance<br/>queued for every enabled backend"]
-          C --> D1["Transcribe with Qwen3-ASR<br/>(qwen worker)"]
-          C --> D2["Transcribe with Cohere<br/>(cohere worker)"]
-          D1 --> E1["Send final on qwen-transcript"]
-          D2 --> E2["Send final on cohere-transcript"]
-          E1 -->|"if the user chose Qwen"| F["Translate Arabic to German<br/>(selectable 4-bit model)"]
-          E2 -->|"if the user chose Cohere"| F
+          C --> D["Transcribe with Cohere"]
+          D --> E["Send final on cohere-transcript"]
+          E --> F["Translate Arabic to German<br/>(TranslateGemma, 4-bit)"]
           F --> G["Send translation on asr-translation"]
           G --> H{"German speech<br/>enabled?"}
           H -->|yes| I["Synthesize &amp; play TTS"]
-          B -->|"still talking &amp; GPU free"| J["Live interim updates while talking,<br/>on the same per-backend topics"]
+          B -->|"still talking &amp; GPU free"| J["Live Cohere interim updates"]
       </div>
 
       <h2>LiveKit message types</h2>
       <table>
         <tr><th>Topic</th><th>type</th><th>When</th><th>What you see</th></tr>
-        <tr><td><code>qwen-transcript</code></td><td><code>interim</code></td><td>While you're still talking, whenever the GPU is idle</td><td>Grey, in-progress Arabic in the Qwen pane</td></tr>
-        <tr><td><code>qwen-transcript</code></td><td><code>final</code></td><td>After a short silence ends the utterance</td><td>Locked-in Arabic in the Qwen pane</td></tr>
         <tr><td><code>cohere-transcript</code></td><td><code>interim</code> / <code>final</code></td><td>Same lifecycle, from the Cohere worker</td><td>Grey / locked-in Arabic in the Cohere pane</td></tr>
-        <tr><td><code>asr-translation</code></td><td><code>translation</code></td><td>After the final utterance of the backend you selected for translation is translated</td><td>German text (+ optional voice)</td></tr>
-        <tr><td><code>qwen-settings</code></td><td><code>settings</code> / <code>capabilities</code></td><td>Web client sends <code>{"audio_output": bool, "translation_asr": "qwen" | "cohere"}</code>; the bot replies once the client connects</td><td>Bot confirms with <code>{"backends": [...], "default_translation_asr": "qwen"}</code></td></tr>
+        <tr><td><code>asr-translation</code></td><td><code>translation</code></td><td>After each final utterance is translated</td><td>German text (+ optional voice)</td></tr>
+        <tr><td><code>asr-settings</code></td><td><code>settings</code></td><td>Web client sends <code>{"audio_output": bool}</code> to control spoken output</td><td>Bot enables or disables TTS for that browser</td></tr>
       </table>
       <p>
         Transcript payloads use the shape <code>{"type": "interim" | "final", "id": str, "text": str}</code>;
@@ -179,12 +166,9 @@
         <li>
           <strong>Configure the <code>.env</code></strong> with the LiveKit credentials
           (<code>LIVEKIT_URL</code>, <code>LIVEKIT_API_KEY</code>, <code>LIVEKIT_API_SECRET</code>)
-          and, to pick your ASR engine(s) and translator, set <code>ASR_BACKENDS</code> and
-          <code>TRANSLATION_BACKEND</code>:
+          and a Hugging Face <code>HF_TOKEN</code> with access to the gated Cohere and TranslateGemma repositories:
           <ul>
-            <li><code>ASR_BACKENDS</code> &mdash; <code>qwen</code> (default, Qwen3-ASR-1.7B), <code>cohere</code> (CohereLabs/cohere-transcribe-arabic-07-2026, a 2B Conformer), or <code>qwen,cohere</code> for both side by side.</li>
-            <li><code>TRANSLATION_BACKEND</code> &mdash; the German translator (only one is loaded): <code>translategemma</code> (default, google/translategemma-12b-it) or <code>qwen3</code> (Qwen/Qwen3-8B); both run at 4-bit. The Qwen3 one keeps up to 3 previous lines as context; TranslateGemma does not.</li>
-            <li><strong>Gated repos need <code>HF_TOKEN</code>:</strong> the default <code>translategemma</code> translator and the <code>cohere</code> ASR backend are gated on huggingface.co &mdash; accept their license terms and add a <code>HF_TOKEN</code> to the <code>.env</code>; both also need <code>transformers&gt;=5.4.0</code> (Colab preinstalls it).</li>
+            <li><strong>Gated models:</strong> accept the terms for Cohere Transcribe Arabic and TranslateGemma on Hugging Face, then add an authorized <code>HF_TOKEN</code> to the <code>.env</code>.</li>
             <li><code>COHERE_4BIT=1</code> &mdash; optional; 4-bit-quantizes the Cohere ASR model to save VRAM.</li>
             <li><strong>Spoken German output needs a reference voice</strong> &mdash; the default F5-TTS
             engine is a voice-cloning model, so set <code>F5_REF_WAV</code> (a ~5&ndash;10 s wav of the
@@ -192,16 +176,12 @@
             spoken in that clip) in the <code>.env</code> before enabling "German speech output" in the
             web app. Set <code>TTS_BACKEND=xtts</code> to use XTTS-v2 instead (no reference clip
             needed &mdash; it picks a pre-made voice via <code>XTTS_SPEAKER</code> / <code>XTTS_SPEAKER_WAV</code>).</li>
-            <li>Other overrides: <code>QWEN_MODEL</code>, <code>QWEN_LANGUAGE</code>, <code>LIVEKIT_ROOM</code>, <code>GEMMA_TRANSLATION_MODEL</code>, <code>QWEN_TRANSLATION_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>F5_GERMAN_REPO</code> / <code>F5_GERMAN_CKPT</code>, <code>MAX_UTTERANCE_SECONDS</code> (default 12 s, longer utterances are split).</li>
+            <li>Other overrides: <code>LIVEKIT_ROOM</code>, <code>COHERE_MODEL</code>, <code>GEMMA_TRANSLATION_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>F5_GERMAN_REPO</code> / <code>F5_GERMAN_CKPT</code>, <code>MAX_UTTERANCE_SECONDS</code> (default 12 s, longer utterances are split).</li>
           </ul>
         </li>
         <li>
-          <strong>VRAM budget on a T4 (15.75 GB):</strong> the default stack &mdash; Qwen3-ASR-1.7B
-          (bf16, ~3.5 GB) + TranslateGemma-12B (4-bit, ~7 GB) &mdash; is &asymp; 11 GB, so one ASR
-          backend plus the default translator fits with room to spare. Running <em>both</em> ASR
-          backends next to the 12B translator (&asymp; 14.5 GB) is tight: enable
-          <code>COHERE_4BIT=1</code>, or pick the lighter <code>qwen3</code> 8B translator (4-bit,
-          ~5 GB) via <code>TRANSLATION_BACKEND=qwen3</code>. The TTS model is not loaded at startup
+          <strong>VRAM budget on a T4 (15.75 GB):</strong> Cohere ASR plus 4-bit TranslateGemma
+          fits without TTS. Enable <code>COHERE_4BIT=1</code> if you need more memory headroom. The TTS model is not loaded at startup
           &mdash; it loads on the first spoken request (triggering a one-time ~2.7 GB checkpoint
           download), and the German F5-TTS model uses ~4.1 GB on GPU (fp16), so leave that much
           headroom before turning on the speech output; <code>TTS_BACKEND=xtts</code> uses the much
@@ -214,9 +194,7 @@
           <code>python -m uvicorn backend.main:app --port 8000</code> from the repo root.
         </li>
         <li>
-          <strong>Translate.</strong> Open <code>http://127.0.0.1:8000</code>, pick the display
-          mode (Qwen3-ASR / Cohere Transcribe Arabic / both side by side &mdash; when both run,
-          choose whose text gets translated to German), optionally enable the German speech
+          <strong>Translate.</strong> Open <code>http://127.0.0.1:8000</code>, optionally enable the German speech
           output, click <strong>Start microphone</strong> and speak Arabic. The Arabic transcript
           appears on the left, the German translation on the right. All settings persist in
           <code>localStorage</code>; stop the Colab runtime (Runtime &gt; Disconnect &amp; delete) when
@@ -226,9 +204,8 @@
       <p>
         <strong>Troubleshooting:</strong> no <code>READY</code> line after ~5 minutes &rarr; check the
         Colab logs (most often a wrong token or a used-up free GPU quota); the web app shows
-        &ldquo;ASR bot missing&rdquo; &rarr; the bot is not in the room yet; the translator or the Cohere
-        ASR model fails to load &rarr; both are gated, so accept the repo terms on huggingface.co and
-        set <code>HF_TOKEN</code> (or use <code>TRANSLATION_BACKEND=qwen3</code>, which is not gated).
+        &ldquo;ASR bot missing&rdquo; &rarr; the bot is not in the room yet; Cohere or TranslateGemma fails to load
+        &rarr; accept both repository terms on huggingface.co and set <code>HF_TOKEN</code>.
       </p>
     </main>
   </body>
