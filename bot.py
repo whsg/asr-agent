@@ -12,6 +12,9 @@ env TRANSLATION_BACKEND ("translategemma" or "qwen3"); only one is loaded:
 
   topic "asr-translation": {"type": "translation", "id": str, "text": str}
 
+On request the translation is also spoken: TTS_BACKEND picks the engine
+("f5" = F5-TTS, default, or "xtts" = XTTS-v2).
+
 Runs on a GPU (e.g. Colab).
 """
 from __future__ import annotations
@@ -24,6 +27,7 @@ import logging
 import os
 import secrets
 import sys
+import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -72,7 +76,6 @@ QWEN_TRANSLATION_MODEL = os.getenv("QWEN_TRANSLATION_MODEL", "Qwen/Qwen3-8B")
 GEMMA_TRANSLATION_MODEL = os.getenv("GEMMA_TRANSLATION_MODEL", "google/translategemma-12b-it")
 TRANSLATION_SOURCE_LANG = os.getenv("TRANSLATION_SOURCE_LANG", "ar").strip() or "ar"
 TRANSLATION_TARGET_LANG = os.getenv("TRANSLATION_TARGET_LANG", "de").strip() or "de"
-XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 AUDIO_SAMPLE_RATE = 24_000
 AUDIO_FRAME_SAMPLES = AUDIO_SAMPLE_RATE // 50
 
@@ -91,6 +94,50 @@ def _env_seconds(name: str, default: float) -> float:
         logger.warning("%s must be > 0; using %s instead", name, default)
         return default
     return value
+
+
+def _env_int(name: str, default: int) -> int:
+    """Reads a positive integer from the env, falling back to the default."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s instead", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("%s must be > 0; using %s instead", name, default)
+        return default
+    return value
+
+
+# Optional spoken output for the translation; TTS_BACKEND picks the engine:
+#   "f5"   (default) F5-TTS - a German target language speaks the German
+#           fine-tune aihpi/F5-TTS-German, other target languages speak the
+#           standard F5-TTS base model (e.g. English).
+#   "xtts" XTTS-v2 (previous engine).
+TTS_BACKEND = os.getenv("TTS_BACKEND", "f5").strip().lower()
+if TTS_BACKEND not in ("f5", "xtts"):
+    logger.warning("Invalid TTS_BACKEND=%r; using 'f5' instead", TTS_BACKEND)
+    TTS_BACKEND = "f5"
+
+# F5-TTS settings.
+F5_GERMAN_REPO = os.getenv("F5_GERMAN_REPO", "aihpi/F5-TTS-German").strip() or "aihpi/F5-TTS-German"
+F5_GERMAN_CKPT = os.getenv("F5_GERMAN_CKPT", "F5TTS_Base/model_420000.safetensors").strip() or "F5TTS_Base/model_420000.safetensors"
+F5_BASE_MODEL = os.getenv("F5_BASE_MODEL", "F5TTS_v1_Base").strip() or "F5TTS_v1_Base"
+# F5-TTS is a voice-cloning model: it needs a short reference clip (~5-10 s)
+# of the desired voice and the spoken text of it (for German, a German clip).
+# F5_REF_WAV: file in the Colab runtime (e.g. /content/reference.wav) or http(s) URL.
+F5_REF_WAV = os.getenv("F5_REF_WAV", "").strip()
+F5_REF_TEXT = os.getenv("F5_REF_TEXT", "").strip()
+# Load EMA weights (recommended for the fully fine-tuned checkpoints).
+F5_USE_EMA = os.getenv("F5_USE_EMA", "1").strip().lower() in ("1", "true", "yes", "on")
+# ODE inference steps (lower is faster, 32 is the F5-TTS default).
+F5_NFE_STEPS = _env_int("F5_NFE_STEPS", 32)
+
+# XTTS-v2 (only used when TTS_BACKEND=xtts).
+XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
 
 SAMPLE_RATE = 16_000
@@ -431,7 +478,23 @@ def translate_text(model, tokenizer, text: str, context: Sequence[tuple[str, str
 
 
 class SpeechSynthesizer:
-    """Loads XTTS only when a connected client requests spoken output."""
+    """Spoken output for the translation; the engine is picked by TTS_BACKEND.
+
+    "f5" (default): F5-TTS - a German target language via the German
+    fine-tune aihpi/F5-TTS-German, other target languages via the standard
+    F5-TTS base model. "xtts": XTTS-v2.
+    The model loads lazily on the first spoken translation request.
+    """
+
+    def __init__(self) -> None:
+        self.engine = XttsSynthesizer() if TTS_BACKEND == "xtts" else F5Synthesizer()
+
+    def synthesize(self, text: str) -> np.ndarray:
+        return self.engine.synthesize(text)
+
+
+class XttsSynthesizer:
+    """XTTS-v2 voice (previous engine; only used when TTS_BACKEND=xtts)."""
 
     def __init__(self) -> None:
         self.model = None
@@ -457,6 +520,88 @@ class SpeechSynthesizer:
         elif self.speaker:
             options["speaker"] = self.speaker
         return np.asarray(self.model.tts(**options), dtype=np.float32).reshape(-1)
+
+
+def _resolve_f5_ref_wav() -> str:
+    """Local path of the F5-TTS reference audio; downloads http(s) URLs once."""
+    if F5_REF_WAV.startswith(("http://", "https://")):
+        dest = Path.home() / ".cache" / "asr-agent" / "f5_ref.wav"
+        if not dest.exists():
+            logger.info("Downloading F5-TTS reference audio to %s ...", dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(F5_REF_WAV, str(dest))
+        return str(dest)
+    path = Path(F5_REF_WAV)
+    if not path.is_file():
+        raise RuntimeError(f"F5 reference file not found: {F5_REF_WAV}")
+    return str(path)
+
+
+class F5Synthesizer:
+    """F5-TTS voice (default engine).
+
+    The voice is cloned from a reference clip (F5_REF_WAV + F5_REF_TEXT). A
+    German target language uses the German fine-tune aihpi/F5-TTS-German, any
+    other target language the standard F5-TTS base model.
+    """
+
+    def __init__(self) -> None:
+        self.model = None
+        self.ref_wav = ""
+
+    def _load(self):
+        if self.model is not None:
+            return self.model
+        from f5_tts.api import F5TTS
+        from huggingface_hub import hf_hub_download
+
+        if not F5_REF_WAV:
+            raise RuntimeError(
+                "TTS backend 'f5' is enabled but F5_REF_WAV is not set. F5-TTS is a "
+                "voice-cloning model: set F5_REF_WAV to a short reference clip "
+                "(~5-10 s wav of the desired voice) available in the Colab runtime and "
+                "F5_REF_TEXT to the spoken text of the clip (or set TTS_BACKEND=xtts)."
+            )
+        if not F5_REF_TEXT:
+            raise RuntimeError(
+                "TTS backend 'f5' is enabled but F5_REF_TEXT is not set. The spoken "
+                "text of the reference clip is required (without it F5-TTS would load "
+                "a ~1.6 GB Whisper model just to transcribe the clip)."
+            )
+        self.ref_wav = _resolve_f5_ref_wav()
+
+        if TRANSLATION_TARGET_LANG.strip().lower() == "de":
+            logger.info("Loading F5-TTS: German fine-tune %s (%s) ...", F5_GERMAN_REPO, F5_GERMAN_CKPT)
+            ckpt_file = hf_hub_download(repo_id=F5_GERMAN_REPO, filename=F5_GERMAN_CKPT)
+            vocab_file = hf_hub_download(repo_id=F5_GERMAN_REPO, filename="vocab.txt")
+            model_name = "F5TTS_Base"
+        else:
+            logger.info("Loading F5-TTS: standard base model %s ...", F5_BASE_MODEL)
+            ckpt_file = ""
+            vocab_file = ""
+            model_name = F5_BASE_MODEL
+        self.model = F5TTS(
+            model=model_name,
+            ckpt_file=ckpt_file,
+            vocab_file=vocab_file,
+            use_ema=F5_USE_EMA,
+            device="cuda:0" if torch.cuda.is_available() else "cpu",
+        )
+        return self.model
+
+    def synthesize(self, text: str) -> np.ndarray:
+        model = self._load()
+        wav, _sample_rate, _spectrogram = model.infer(
+            ref_file=self.ref_wav,
+            ref_text=F5_REF_TEXT,
+            gen_text=text,
+            show_info=lambda *args: None,
+            progress=None,
+            nfe_step=F5_NFE_STEPS,
+        )
+        if wav is None:
+            return np.zeros(0, dtype=np.float32)
+        return np.asarray(wav, dtype=np.float32).reshape(-1)
 
 
 def prepare_models():
@@ -785,6 +930,17 @@ async def main() -> None:
     logger.info("LiveKit credentials are valid.")
     logger.info("ASR backends: %s", ", ".join(ASR_BACKENDS))
     logger.info("Translation backend: %s", TRANSLATION_BACKEND)
+    if TTS_BACKEND == "f5":
+        if not F5_REF_WAV or not F5_REF_TEXT:
+            logger.warning(
+                "TTS backend is f5 (F5-TTS) but F5_REF_WAV/F5_REF_TEXT are not set - "
+                "spoken output will fail until the reference clip is configured "
+                "(or set TTS_BACKEND=xtts)."
+            )
+        else:
+            logger.info("TTS backend: f5 (reference voice: %s)", F5_REF_WAV)
+    else:
+        logger.info("TTS backend: xtts")
     logger.info("Max utterance length: %.2f s", MAX_UTTERANCE_SECONDS)
     if "cohere" in ASR_BACKENDS and not HF_TOKEN:
         logger.warning("Cohere ASR is enabled but HF_TOKEN is missing - the repo is gated, so loading will fail.")

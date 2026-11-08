@@ -8,9 +8,12 @@ Live Arabic-to-German transcription and translation for a LiveKit room:
   German using the previous three utterances as speaker-specific context.
   - ASR backends (env `ASR_BACKENDS`): `qwen` (Qwen3-ASR-1.7B, default),
     `cohere` (CohereLabs/cohere-transcribe-arabic-07-2026) or both.
-  - XTTS-v2 German speech is optional per browser session and is disabled by
-    default. Enable **German speech output (XTTS-v2)** before starting the
-    microphone. The TTS model is downloaded and loaded only when selected.
+  - German speech output is optional per browser session and disabled by
+    default (engine chosen by env `TTS_BACKEND`: `f5` = F5-TTS, default, or
+    `xtts` = XTTS-v2). For a German target, F5-TTS uses the fine-tuned
+    `aihpi/F5-TTS-German` model; other targets use the standard F5-TTS base
+    model. Enable **German speech output** before starting the microphone -
+    the TTS model is downloaded and loaded only when selected.
 - **Your PC** runs only a small web server with the browser microphone client.
 - **LiveKit Cloud** connects both.
 
@@ -40,8 +43,15 @@ translated to German.
 | `QWEN_MODEL` | `Qwen/Qwen3-ASR-1.7B` | Qwen ASR model |
 | `QWEN_LANGUAGE` | `Arabic` | Language hint passed to Qwen ASR |
 | `LIVEKIT_ROOM` | `qwen-asr-live` | Room name (must match the web server) |
-| `XTTS_SPEAKER` | - | XTTS-v2 speaker name |
-| `XTTS_SPEAKER_WAV` | - | Path to a reference voice available in Colab |
+| `TTS_BACKEND` | `f5` | Speech engine: `f5` (F5-TTS) or `xtts` (XTTS-v2) |
+| `F5_REF_WAV` | - | **Required for `f5`**: reference voice clip (~5-10 s wav) in the Colab runtime or an http(s) URL; for German use a German clip |
+| `F5_REF_TEXT` | - | **Required for `f5`**: the exact spoken text of the reference clip |
+| `F5_GERMAN_REPO` | `aihpi/F5-TTS-German` | German fine-tune used when the target language is German |
+| `F5_GERMAN_CKPT` | `F5TTS_Base/model_420000.safetensors` | Checkpoint inside that repo (`295000`, `365000`, `420000` available) |
+| `F5_USE_EMA` | `1` | Load EMA weights (recommended for the fully fine-tuned checkpoints) |
+| `F5_NFE_STEPS` | `32` | ODE inference steps, lower is faster |
+| `XTTS_SPEAKER` | - | XTTS-v2 speaker name (only used when `TTS_BACKEND=xtts`) |
+| `XTTS_SPEAKER_WAV` | - | XTTS-v2 reference voice path in Colab (only used when `TTS_BACKEND=xtts`) |
 | `MAX_UTTERANCE_SECONDS` | `12.0` | Longest utterance (seconds) sent to the ASR, then split |
 
 **Cohere setup (gated repo):** accept the model terms at
@@ -49,8 +59,10 @@ https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026 and set a
 matching `HF_TOKEN` in `.env`, then start with `ASR_BACKENDS=qwen,cohere`.
 
 **VRAM on a T4 (15.75 GB):** both backends in 16-bit plus the 4-bit
-Qwen3-8B translator fit without XTTS (~13 GB). Set `COHERE_4BIT=1` if you
-need more headroom.
+Qwen3-8B translator fit without TTS (~13 GB). F5-TTS adds the DiT model plus
+the Vococodec/Vocoder (fp16 weights of the ~1.35 GB German checkpoint), which
+fits in the remaining headroom; XTTS-v2 is comparable. Set `COHERE_4BIT=1`
+if you need more headroom.
 
 ## 2. Web client on your PC
 
@@ -72,10 +84,14 @@ appears while speaking; final Arabic and the German translation appear after
 a short pause.
 
 The Colab runtime needs a GPU with enough memory for the selected ASR
-backend(s), the 4-bit translator and optionally XTTS-v2 (see the VRAM notes
-above). XTTS uses a built-in German speaker by default. To use a reference
-voice, set `XTTS_SPEAKER_WAV` to an audio file available in the Colab
-runtime; check the XTTS-v2 model license before using it commercially.
+backend(s), the 4-bit translator and optionally the TTS engine (see the VRAM
+notes above). F5-TTS (`TTS_BACKEND=f5`, default) is a voice-cloning model:
+set `F5_REF_WAV` to a short reference clip (~5-10 s wav of the desired
+voice, in the Colab runtime or as an http(s) URL) and `F5_REF_TEXT` to its
+exact spoken text. Check the F5-TTS / German fine-tune licenses before using
+them commercially. With `TTS_BACKEND=xtts`, XTTS-v2 uses a built-in German
+speaker by default; to use a reference voice there, set `XTTS_SPEAKER_WAV`
+to an audio file available in the Colab runtime.
 
 All bot environment variables are documented in the table above and in
 [.env.example](./.env.example).

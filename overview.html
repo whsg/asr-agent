@@ -89,7 +89,7 @@
         </div>
         <div class="card">
           <h3>🤖 Colab (T4 GPU)</h3>
-          <p><code>bot.py</code>: shared Silero VAD + selectable ASR backends (<code>ASR_BACKENDS</code>: <code>qwen</code>, <code>cohere</code>, or <code>qwen,cohere</code>) + a selectable 4-bit translator (<code>TRANSLATION_BACKEND</code>: <code>translategemma</code> 12B (default) or <code>qwen3</code> 8B &mdash; only one loaded) + XTTS-v2 (optional TTS). One async worker per enabled backend, all GPU work behind a single shared lock.</p>
+          <p><code>bot.py</code>: shared Silero VAD + selectable ASR backends (<code>ASR_BACKENDS</code>: <code>qwen</code>, <code>cohere</code>, or <code>qwen,cohere</code>) + a selectable 4-bit translator (<code>TRANSLATION_BACKEND</code>: <code>translategemma</code> 12B (default) or <code>qwen3</code> 8B &mdash; only one loaded) + F5-TTS spoken output (default, <code>TTS_BACKEND=f5</code> &mdash; uses the German fine-tune <code>aihpi/F5-TTS-German</code>); <code>TTS_BACKEND=xtts</code> falls back to XTTS-v2. One async worker per enabled backend, all GPU work behind a single shared lock.</p>
         </div>
       </div>
 
@@ -108,7 +108,7 @@
             ASRQ["Qwen3-ASR-1.7B<br/>qwen-transcript"]
             ASRC["Cohere Transcribe Arabic<br/>cohere-transcript"]
             TR["Translator (4-bit)<br/>translategemma-12b-it (default)<br/>or qwen3-8b"]
-            TTS["XTTS-v2<br/>German speech (opt.)"]
+            TTS["F5-TTS (default), XTTS-v2 fallback<br/>German speech (opt.)"]
             SEGC --> ASRQ
             SEGC --> ASRC
             ASRQ -->|final of the user-selected backend| TR
@@ -186,7 +186,13 @@
             <li><code>TRANSLATION_BACKEND</code> &mdash; the German translator (only one is loaded): <code>translategemma</code> (default, google/translategemma-12b-it) or <code>qwen3</code> (Qwen/Qwen3-8B); both run at 4-bit. The Qwen3 one keeps up to 3 previous lines as context; TranslateGemma does not.</li>
             <li><strong>Gated repos need <code>HF_TOKEN</code>:</strong> the default <code>translategemma</code> translator and the <code>cohere</code> ASR backend are gated on huggingface.co &mdash; accept their license terms and add a <code>HF_TOKEN</code> to the <code>.env</code>; both also need <code>transformers&gt;=5.4.0</code> (Colab preinstalls it).</li>
             <li><code>COHERE_4BIT=1</code> &mdash; optional; 4-bit-quantizes the Cohere ASR model to save VRAM.</li>
-            <li>Optional overrides: <code>QWEN_MODEL</code>, <code>QWEN_LANGUAGE</code>, <code>LIVEKIT_ROOM</code>, <code>GEMMA_TRANSLATION_MODEL</code>, <code>QWEN_TRANSLATION_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>XTTS_SPEAKER</code> / <code>XTTS_SPEAKER_WAV</code>, <code>MAX_UTTERANCE_SECONDS</code> (default 12 s, longer utterances are split).</li>
+            <li><strong>Spoken German output needs a reference voice</strong> &mdash; the default F5-TTS
+            engine is a voice-cloning model, so set <code>F5_REF_WAV</code> (a ~5&ndash;10 s wav of the
+            voice you want; a URL or a Colab file path) and <code>F5_REF_TEXT</code> (the exact text
+            spoken in that clip) in the <code>.env</code> before enabling "German speech output" in the
+            web app. Set <code>TTS_BACKEND=xtts</code> to use XTTS-v2 instead (no reference clip
+            needed &mdash; it picks a pre-made voice via <code>XTTS_SPEAKER</code> / <code>XTTS_SPEAKER_WAV</code>).</li>
+            <li>Other overrides: <code>QWEN_MODEL</code>, <code>QWEN_LANGUAGE</code>, <code>LIVEKIT_ROOM</code>, <code>GEMMA_TRANSLATION_MODEL</code>, <code>QWEN_TRANSLATION_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>F5_GERMAN_REPO</code> / <code>F5_GERMAN_CKPT</code>, <code>MAX_UTTERANCE_SECONDS</code> (default 12 s, longer utterances are split).</li>
           </ul>
         </li>
         <li>
@@ -195,7 +201,11 @@
           backend plus the default translator fits with room to spare. Running <em>both</em> ASR
           backends next to the 12B translator (&asymp; 14.5 GB) is tight: enable
           <code>COHERE_4BIT=1</code>, or pick the lighter <code>qwen3</code> 8B translator (4-bit,
-          ~5 GB) via <code>TRANSLATION_BACKEND=qwen3</code>.
+          ~5 GB) via <code>TRANSLATION_BACKEND=qwen3</code>. The TTS model is not loaded at startup
+          &mdash; it loads on the first spoken request (triggering a one-time ~2.7 GB checkpoint
+          download), and the German F5-TTS model uses ~4.1 GB on GPU (fp16), so leave that much
+          headroom before turning on the speech output; <code>TTS_BACKEND=xtts</code> uses the much
+          smaller XTTS-v2 instead.
         </li>
         <li>
           <strong>Start the web app on your PC.</strong> Install

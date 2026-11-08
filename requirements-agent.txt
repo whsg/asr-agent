@@ -1,5 +1,6 @@
 livekit>=1.0
 livekit-api>=1.0
+f5-tts
 transformers>=5.4.0
 bitsandbytes>=0.45
 accelerate
