@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Arabisch-Deutsch Live-Uebersetzung</title>
+    <title>Arabic-German Live Translation</title>
     <style>
       :root {
         color-scheme: light;
@@ -86,7 +86,68 @@
         background: #dc2626;
       }
 
-      #transcript {
+      .hidden {
+        display: none !important;
+      }
+
+      .asr-modes {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        margin: 4px 0 16px;
+        color: #34425b;
+      }
+
+      .asr-modes-label {
+        font-weight: 600;
+        color: #4a5872;
+        font-size: 0.95rem;
+      }
+
+      .asr-modes label.option {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+      }
+
+      .option-group {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .panes {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 16px;
+        align-items: start;
+      }
+
+      .panes.both {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      @media (max-width: 700px) {
+        .panes.both {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .pane-caption {
+        display: none;
+        margin: 0 0 6px;
+        color: #4a5872;
+        font-size: 0.9rem;
+        font-weight: 600;
+      }
+
+      .panes.both .pane-caption {
+        display: block;
+      }
+
+      .asr-text {
         height: 50vh;
         min-height: 220px;
         overflow-y: auto;
@@ -99,17 +160,17 @@
         overflow-wrap: anywhere;
       }
 
-      #transcript:empty::before {
+      .asr-text:empty::before {
         content: attr(data-placeholder);
         color: #9aa3b5;
         font-size: 1rem;
       }
 
-      #transcript p {
+      .asr-text p {
         margin: 0 0 0.35em;
       }
 
-      #transcript .interim {
+      .asr-text .interim {
         color: #8a94a8;
       }
 
@@ -181,28 +242,48 @@
   </head>
   <body>
     <main>
-      <h1>Arabisch-Deutsch Live-Uebersetzung</h1>
-      <p>Sprich Arabisch. Der erkannte Text und die deutsche Uebersetzung erscheinen nach jeder Sprechpause.</p>
+      <h1>Arabic-German Live Translation</h1>
+      <p>Speak Arabic. The recognized text and the German translation appear after each pause.</p>
       <div class="controls">
-        <button id="start" type="button">Mikrofon starten</button>
-        <button id="stop" type="button" disabled>Beenden</button>
-        <span id="status" class="badge" role="status">Bereit</span>
-        <span id="bot" class="badge">ASR-Bot: nicht verbunden</span>
+        <button id="start" type="button">Start microphone</button>
+        <button id="stop" type="button" disabled>Stop</button>
+        <span id="status" class="badge" role="status">Ready</span>
+        <span id="bot" class="badge">ASR bot: not connected</span>
       </div>
       <div class="mic-row">
-        <select id="mic" aria-label="Mikrofon"><option value="">Standard-Mikrofon</option></select>
-        <meter id="level" min="0" max="1" value="0" aria-label="Mikrofon-Pegel"></meter>
+        <select id="mic" aria-label="Microphone"><option value="">Default microphone</option></select>
+        <meter id="level" min="0" max="1" value="0" aria-label="Microphone level"></meter>
       </div>
-      <label class="audio-option"><input id="audio-enabled" type="checkbox"> Deutsche Sprachausgabe (XTTS-v2)</label>
-      <p id="warning" role="alert" hidden>Das Mikrofon liefert kein Signal. Waehle ein anderes Mikrofon und pruefe, dass es im System nicht stummgeschaltet ist.</p>
-      <p class="language-label">Arabisch</p>
-      <div id="transcript" lang="ar" dir="rtl" aria-live="polite" data-placeholder="Der erkannte Text erscheint hier …"></div>
-      <p class="language-label">Deutsch</p>
-      <div id="translations" lang="de" dir="ltr" aria-live="polite" data-placeholder="Die deutsche Uebersetzung erscheint hier …"></div>
+      <label class="audio-option"><input id="audio-enabled" type="checkbox"> German speech output (XTTS-v2)</label>
+      <div class="asr-modes">
+        <span class="asr-modes-label">ASR model:</span>
+        <label class="option"><input type="radio" name="asr" value="qwen" checked> Qwen3-ASR</label>
+        <label class="option"><input type="radio" name="asr" value="cohere"> Cohere Transcribe Arabic</label>
+        <label class="option"><input type="radio" name="asr" value="both"> Side by side</label>
+        <span id="trans-source" class="option-group hidden">
+          <span>Translate from:</span>
+          <label class="option"><input type="radio" name="trans" value="qwen" checked> Qwen</label>
+          <label class="option"><input type="radio" name="trans" value="cohere"> Cohere</label>
+        </span>
+      </div>
+      <p id="warning" role="alert" hidden>The microphone is not producing a signal. Choose a different microphone and make sure it is not muted in the system.</p>
+      <p class="language-label">Arabic</p>
+      <div id="panes" class="panes">
+        <div class="pane" id="pane-qwen">
+          <p class="pane-caption">Qwen3-ASR</p>
+          <div id="transcript-qwen" class="asr-text" lang="ar" dir="rtl" aria-live="polite" data-placeholder="Recognized text appears here ..."></div>
+        </div>
+        <div class="pane hidden" id="pane-cohere">
+          <p class="pane-caption">Cohere Transcribe Arabic</p>
+          <div id="transcript-cohere" class="asr-text" lang="ar" dir="rtl" aria-live="polite" data-placeholder="Recognized text appears here ..."></div>
+        </div>
+      </div>
+      <p class="language-label">German</p>
+      <div id="translations" lang="de" dir="ltr" aria-live="polite" data-placeholder="The German translation appears here ..."></div>
       <div id="audio-output" aria-hidden="true"></div>
       <div class="controls">
-        <button id="copy" class="secondary" type="button">Text kopieren</button>
-        <button id="clear" class="secondary" type="button">Leeren</button>
+        <button id="copy" class="secondary" type="button">Copy text</button>
+        <button id="clear" class="secondary" type="button">Clear</button>
       </div>
     </main>
 
@@ -210,7 +291,9 @@
       import { Room, RoomEvent, Track } from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
 
       const BOT_IDENTITY = "qwen-asr-bot";
-      const TOPIC = "qwen-transcript";
+      const TOPIC_QWEN = "qwen-transcript";
+      const TOPIC_COHERE = "cohere-transcript";
+      const TRANSLATION_TOPIC = "asr-translation";
       const SETTINGS_TOPIC = "qwen-settings";
       const SILENT_LEVEL = 0.002;
 
@@ -222,7 +305,6 @@
       const micSelect = $("#mic");
       const levelMeter = $("#level");
       const warning = $("#warning");
-      const transcript = $("#transcript");
       const translations = $("#translations");
       const audioEnabled = $("#audio-enabled");
       const audioOutput = $("#audio-output");
@@ -230,8 +312,17 @@
       const clearButton = $("#clear");
       const decoder = new TextDecoder();
       const encoder = new TextEncoder();
-      const lines = new Map();
       const translationLines = new Map();
+
+      const PANES = {
+        qwen: { label: "Qwen3-ASR", element: $("#transcript-qwen"), lines: new Map() },
+        cohere: { label: "Cohere Transcribe Arabic", element: $("#transcript-cohere"), lines: new Map() },
+      };
+      const panesWrap = $("#panes");
+      const paneEls = { qwen: $("#pane-qwen"), cohere: $("#pane-cohere") };
+      const modeRadios = [...document.querySelectorAll('input[name="asr"]')];
+      const transRadios = [...document.querySelectorAll('input[name="trans"]')];
+      const transSourceBox = $("#trans-source");
       let room;
       let meter;
 
@@ -243,10 +334,10 @@
       const setStatus = (text, state) => setBadge(statusBadge, text, state);
 
       function updateBotStatus() {
-        if (!room) return setBadge(botBadge, "ASR-Bot: nicht verbunden");
+        if (!room) return setBadge(botBadge, "ASR bot: not connected");
         const present = [...room.remoteParticipants.values()].some((p) => p.identity === BOT_IDENTITY);
-        if (present) setBadge(botBadge, "ASR-Bot bereit", "ok");
-        else setBadge(botBadge, "ASR-Bot fehlt – Colab-Notebook starten", "warn");
+        if (present) setBadge(botBadge, "ASR bot ready", "ok");
+        else setBadge(botBadge, "ASR bot missing - start the Colab notebook", "warn");
       }
 
       async function refreshMicrophones() {
@@ -256,7 +347,7 @@
         if (!devices.length) return;
         const wanted = room?.getActiveDevice("audioinput") || micSelect.value || localStorage.getItem("micId");
         micSelect.replaceChildren(
-          ...devices.map((device, index) => new Option(device.label || `Mikrofon ${index + 1}`, device.deviceId)),
+          ...devices.map((device, index) => new Option(device.label || `Microphone ${index + 1}`, device.deviceId)),
         );
         if (devices.some((device) => device.deviceId === wanted)) micSelect.value = wanted;
       }
@@ -294,23 +385,24 @@
       }
 
       // One line per utterance: interim text is replaced in place, the final text locks it.
-      function showTranscript({ type, id, text }) {
-        let line = lines.get(id);
+      function showTranscript(backend, { type, id, text }) {
+        const pane = PANES[backend];
+        let line = pane.lines.get(id);
         if (line?.classList.contains("final")) return;
         if (type === "final" && !text) {
           line?.remove();
-          lines.delete(id);
+          pane.lines.delete(id);
           return;
         }
-        const atBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 48;
+        const atBottom = pane.element.scrollHeight - pane.element.scrollTop - pane.element.clientHeight < 48;
         if (!line) {
           line = document.createElement("p");
-          lines.set(id, line);
-          transcript.append(line);
+          pane.lines.set(id, line);
+          pane.element.append(line);
         }
         line.textContent = text;
         line.className = type;
-        if (atBottom) transcript.scrollTop = transcript.scrollHeight;
+        if (atBottom) pane.element.scrollTop = pane.element.scrollHeight;
       }
 
       function showTranslation({ id, text }) {
@@ -330,7 +422,7 @@
         element.autoplay = true;
         element.muted = !audioEnabled.checked;
         audioOutput.replaceChildren(element);
-        element.play().catch(() => setStatus("Browser blockiert Audiowiedergabe", "warn"));
+        element.play().catch(() => setStatus("Browser blocked audio playback", "warn"));
       }
 
       function onTrackUnsubscribed(track, _publication, participant) {
@@ -339,16 +431,24 @@
       }
 
       function onData(payload, _participant, _kind, topic) {
-        if (topic !== TOPIC) return;
         let message;
         try {
           message = JSON.parse(decoder.decode(payload));
         } catch {
           return;
         }
+        if (topic === SETTINGS_TOPIC) {
+          applyCapabilities(message);
+          return;
+        }
+        if (message.type === "translation") {
+          if (topic === TRANSLATION_TOPIC) showTranslation(message);
+          return;
+        }
+        if (topic !== TOPIC_QWEN && topic !== TOPIC_COHERE) return;
+        if (message.type !== "interim" && message.type !== "final") return;
         if (typeof message.id !== "string" || typeof message.text !== "string") return;
-        if (message.type === "interim" || message.type === "final") showTranscript(message);
-        else if (message.type === "translation") showTranslation(message);
+        showTranscript(topic === TOPIC_QWEN ? "qwen" : "cohere", message);
       }
 
       function createRoom() {
@@ -363,11 +463,11 @@
           .on(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed)
           .on(RoomEvent.ParticipantConnected, updateBotStatus)
           .on(RoomEvent.ParticipantDisconnected, updateBotStatus)
-          .on(RoomEvent.Reconnecting, () => setStatus("Verbindung unterbrochen – verbinde neu …", "warn"))
-          .on(RoomEvent.Reconnected, () => setStatus("Live – sprich Arabisch", "ok"))
+          .on(RoomEvent.Reconnecting, () => setStatus("Connection interrupted - reconnecting ...", "warn"))
+          .on(RoomEvent.Reconnected, () => setStatus("Live - speak Arabic", "ok"))
           .on(RoomEvent.MediaDevicesChanged, () => refreshMicrophones().catch(() => {}))
           .on(RoomEvent.Disconnected, () => {
-            if (room === newRoom) teardown("Verbindung getrennt", "error");
+            if (room === newRoom) teardown("Connection lost", "error");
           });
         return newRoom;
       }
@@ -386,28 +486,25 @@
       async function start() {
         startButton.disabled = true;
         audioEnabled.disabled = true;
-        setStatus("Verbinde …", "warn");
+        setStatus("Connecting ...", "warn");
         try {
           const response = await fetch("/api/session", { method: "POST" });
           if (!response.ok) {
             const body = await response.json().catch(() => ({}));
-            throw new Error(body.detail || `Backend-Fehler (${response.status})`);
+            throw new Error(body.detail || `Backend error (${response.status})`);
           }
           const session = await response.json();
           room = createRoom();
           await room.connect(session.server_url, session.token);
-          await room.localParticipant.publishData(
-            encoder.encode(JSON.stringify({ type: "settings", audio_output: audioEnabled.checked })),
-            { reliable: true, topic: SETTINGS_TOPIC },
-          );
+          sendSettings();
           updateBotStatus();
           await enableMicrophone();
           await refreshMicrophones();
           startMeter();
           stopButton.disabled = false;
-          setStatus("Live – sprich Arabisch", "ok");
+          setStatus("Live - speak Arabic", "ok");
         } catch (error) {
-          await teardown(`Fehler: ${error.message}`, "error");
+          await teardown(`Error: ${error.message}`, "error");
         }
       }
 
@@ -430,31 +527,110 @@
           await room.switchActiveDevice("audioinput", micSelect.value);
           startMeter();
         } catch (error) {
-          setStatus(`Fehler: ${error.message}`, "error");
+          setStatus(`Error: ${error.message}`, "error");
         }
       }
 
       async function copyTranscript() {
-        const text = [...transcript.querySelectorAll("p.final")].map((line) => line.textContent).join("\n");
+        const names = getMode() === "both" ? ["qwen", "cohere"] : [getMode()];
+        const text = names
+          .map((name) => {
+            const finals = [...PANES[name].lines.values()]
+              .filter((line) => line.classList.contains("final"))
+              .map((line) => line.textContent)
+              .filter(Boolean);
+            return finals.length ? [`${PANES[name].label}:`, ...finals].join("\n") : "";
+          })
+          .filter(Boolean)
+          .join("\n\n");
         if (!text) return;
         try {
           await navigator.clipboard.writeText(text);
-          copyButton.textContent = "Kopiert";
+          copyButton.textContent = "Copied";
         } catch {
-          copyButton.textContent = "Kopieren nicht moeglich";
+          copyButton.textContent = "Copy not possible";
         }
-        setTimeout(() => (copyButton.textContent = "Text kopieren"), 1500);
+        setTimeout(() => (copyButton.textContent = `Copy text`), 1500);
       }
 
       function clearTranscript() {
-        transcript.replaceChildren();
+        for (const pane of Object.values(PANES)) {
+          pane.element.replaceChildren();
+          pane.lines.clear();
+        }
         translations.replaceChildren();
-        lines.clear();
         translationLines.clear();
       }
 
+      function getMode() {
+        return modeRadios.find((radio) => radio.checked)?.value || "qwen";
+      }
+
+      function getTranslationAsr() {
+        return getMode() === "both"
+          ? transRadios.find((radio) => radio.checked)?.value || "qwen"
+          : getMode();
+      }
+
+      function applyMode() {
+        const mode = getMode();
+        panesWrap.classList.toggle("both", mode === "both");
+        for (const name of Object.keys(PANES)) {
+          paneEls[name].classList.toggle("hidden", mode !== "both" && mode !== name);
+        }
+        transSourceBox.classList.toggle("hidden", mode !== "both");
+        localStorage.setItem("asrMode", mode);
+        localStorage.setItem("translationAsr", getTranslationAsr());
+      }
+
+      function sendSettings() {
+        if (!room) return;
+        room.localParticipant.publishData(
+          encoder.encode(
+            JSON.stringify({
+              type: "settings",
+              audio_output: audioEnabled.checked,
+              translation_asr: getTranslationAsr(),
+            }),
+          ),
+          { reliable: true, topic: SETTINGS_TOPIC },
+        );
+      }
+
+      // The bot answers settings messages with the backends it actually has loaded.
+      function applyCapabilities(message) {
+        if (!message || message.type !== "capabilities") return;
+        const loaded = new Set(message.backends || []);
+        if (!loaded.size) return;
+        for (const radio of modeRadios) {
+          radio.disabled = radio.value === "both" ? loaded.size < 2 : !loaded.has(radio.value);
+        }
+        for (const radio of transRadios) radio.disabled = !loaded.has(radio.value);
+        const fallback = loaded.has("qwen") ? "qwen" : [...loaded][0] || "qwen";
+        const mode = getMode();
+        if (mode !== "both" && !loaded.has(mode)) {
+          modeRadios.find((radio) => radio.value === fallback)?.click();
+        }
+        if (getMode() === "both" && !loaded.has(getTranslationAsr())) {
+          transRadios.find((radio) => radio.value === fallback)?.click();
+        }
+        sendSettings();
+      }
+
+      for (const radio of [...modeRadios, ...transRadios]) {
+        radio.addEventListener("change", () => {
+          applyMode();
+          sendSettings();
+        });
+      }
+
+      // Restore the last chosen ASR mode from a previous session.
+      modeRadios.find((radio) => radio.value === localStorage.getItem("asrMode"))?.click();
+      transRadios.find((radio) => radio.value === localStorage.getItem("translationAsr"))?.click();
+      applyMode();
+
       startButton.addEventListener("click", start);
-      stopButton.addEventListener("click", () => teardown("Beendet"));
+      stopButton.addEventListener("click", () => teardown("Stopped"));
       micSelect.addEventListener("change", changeMicrophone);
       copyButton.addEventListener("click", copyTranscript);
       clearButton.addEventListener("click", clearTranscript);

@@ -35,7 +35,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Qwen3 Arabic Live Transcription", lifespan=lifespan)
+app = FastAPI(title="Qwen3 Arabic Live Transcription and Translation", lifespan=lifespan)
 
 
 def to_ws_url(url: str) -> str:
