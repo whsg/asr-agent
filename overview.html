@@ -69,10 +69,10 @@
         A browser mic client streams speech over <strong>LiveKit</strong> to a GPU bot on
         <strong>Google Colab</strong>. The bot cuts the audio into sentences with a shared
         Silero-VAD segmenter and transcribes every utterance with
-        <strong>Cohere Transcribe Arabic</strong>. The Arabic text is translated to German by
-        <strong>TranslateGemma-12B</strong>,
-        &mdash; and the transcripts (plus optional German speech) are sent back to the browser in
-        near real time.
+        <strong>Cohere Transcribe Arabic</strong>. The Arabic text is then translated to German by
+        <strong>TranslateGemma</strong> (12B by default, or a smaller/faster 4B via
+        <code>GEMMA_TRANSLATION_MODEL</code>), and the transcripts (plus optional German speech) are
+        sent back to the browser in near real time.
       </p>
 
       <div class="grid">
@@ -170,6 +170,7 @@
           <ul>
             <li><strong>Gated models:</strong> accept the terms for Cohere Transcribe Arabic and TranslateGemma on Hugging Face, then add an authorized <code>HF_TOKEN</code> to the <code>.env</code>.</li>
             <li><code>COHERE_4BIT=1</code> &mdash; optional; 4-bit-quantizes the Cohere ASR model to save VRAM.</li>
+            <li><code>GEMMA_TRANSLATION_MODEL</code> &mdash; <code>google/translategemma-12b-it</code> (default, best quality) or <code>google/translategemma-4b-it</code> for a smaller/faster model that uses less VRAM.</li>
             <li><strong>Spoken German output needs a reference voice</strong> &mdash; the default F5-TTS
             engine is a voice-cloning model, so set <code>F5_REF_WAV</code> (a ~5&ndash;10 s wav of the
             voice you want; a URL or a Colab file path) and <code>F5_REF_TEXT</code> (the exact text
@@ -180,8 +181,9 @@
           </ul>
         </li>
         <li>
-          <strong>VRAM budget on a T4 (15.75 GB):</strong> Cohere ASR plus 4-bit TranslateGemma
-          fits without TTS. Enable <code>COHERE_4BIT=1</code> if you need more memory headroom. The TTS model is not loaded at startup
+          <strong>VRAM budget on a T4 (15.75 GB):</strong> Cohere ASR plus 4-bit TranslateGemma (12B or 4B)
+          fits without TTS &mdash; pick the 4B model if you need extra headroom. Enable <code>COHERE_4BIT=1</code> to free
+          more memory. The TTS model is not loaded at startup
           &mdash; it loads on the first spoken request (triggering a one-time ~2.7 GB checkpoint
           download), and the German F5-TTS model uses ~4.1 GB on GPU (fp16), so leave that much
           headroom before turning on the speech output; <code>TTS_BACKEND=xtts</code> uses the much

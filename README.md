@@ -32,7 +32,7 @@ Live Arabic-to-German transcription and translation for a LiveKit room:
 | `COHERE_MODEL` | `CohereLabs/cohere-transcribe-arabic-07-2026` | Cohere ASR model |
 | `COHERE_4BIT` | `0` | Load the Cohere model in 4-bit to save VRAM |
 | `COHERE_LANGUAGE` | `ar` | Language hint passed to Cohere ASR |
-| `GEMMA_TRANSLATION_MODEL` | `google/translategemma-12b-it` | TranslateGemma model |
+| `GEMMA_TRANSLATION_MODEL` | `google/translategemma-12b-it` | TranslateGemma model; default 12B, or `google/translategemma-4b-it` for a smaller/faster option |
 | `LIVEKIT_ROOM` | `arabic-asr-live` | Room name (must match the web server) |
 | `TTS_BACKEND` | `f5` | Speech engine: `f5` (F5-TTS) or `xtts` (XTTS-v2) |
 | `F5_REF_WAV` | - | **Required for `f5`**: reference voice clip (~5-10 s wav) in the Colab runtime or an http(s) URL; for German use a German clip |
@@ -47,7 +47,8 @@ Live Arabic-to-German transcription and translation for a LiveKit room:
 
 **Hugging Face setup:** accept the model terms for
 [Cohere Transcribe Arabic](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026)
-and [TranslateGemma](https://huggingface.co/google/translategemma-12b-it), then
+and [TranslateGemma](https://huggingface.co/google/translategemma-12b-it)
+(12B default, or [4B](https://huggingface.co/google/translategemma-4b-it) via `GEMMA_TRANSLATION_MODEL`), then
 set an authorized `HF_TOKEN` in `.env` or Colab Secrets. Colab downloads both
 model weights into its runtime. F5-TTS weights download the first time speech
 output is requested.

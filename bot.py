@@ -264,7 +264,10 @@ def cohere_transcribe(processor, model, audio: np.ndarray) -> str:
     inputs = inputs.to(model.device, dtype=model.dtype)
     with torch.inference_mode():
         outputs = model.generate(**inputs, max_new_tokens=256)
-    return processor.decode(outputs, skip_special_tokens=True).strip()
+    decoded = processor.decode(outputs, skip_special_tokens=True)
+    if isinstance(decoded, list):
+        decoded = decoded[0] if decoded else ""
+    return decoded.strip()
 
 
 class AsrBackend:
@@ -315,13 +318,27 @@ def _bits_and_bytes_4bit(dtype):
 
 
 def load_translategemma(dtype, device_map):
-    """Loads TranslateGemma 12B (4-bit) for direct text translation (gated repo)."""
+    """Loads the 4-bit TranslateGemma model set by GEMMA_TRANSLATION_MODEL (gated repo).
+
+    Both the 12B (default) and the smaller/faster 4B variants share the same
+    architecture and chat template, so switching sizes is a one-line env change.
+    """
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     load_kwargs = {}
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
     processor = AutoProcessor.from_pretrained(GEMMA_TRANSLATION_MODEL, **load_kwargs)
+    from huggingface_hub import hf_hub_download
+
+    template_path = hf_hub_download(
+        repo_id=GEMMA_TRANSLATION_MODEL,
+        filename="chat_template.jinja",
+        **load_kwargs,
+    )
+    chat_encoder = processor if getattr(processor, "chat_template", None) else getattr(processor, "tokenizer", processor)
+    if not getattr(chat_encoder, "chat_template", None):
+        chat_encoder.chat_template = Path(template_path).read_text(encoding="utf-8")
     model = AutoModelForImageTextToText.from_pretrained(
         GEMMA_TRANSLATION_MODEL,
         quantization_config=_bits_and_bytes_4bit(dtype),
@@ -347,7 +364,8 @@ def _translate_text_translategemma(model, processor, text: str) -> str:
             ],
         }
     ]
-    inputs = processor.apply_chat_template(
+    chat_encoder = processor if getattr(processor, "chat_template", None) else processor.tokenizer
+    inputs = chat_encoder.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=True,
@@ -717,8 +735,8 @@ async def run_room(models, translator, processor, url: str, key: str, secret: st
     room = rtc.Room()
     audio_source = rtc.AudioSource(sample_rate=AUDIO_SAMPLE_RATE, num_channels=1, queue_size_ms=3000)
     gpu_lock = asyncio.Lock()
-    processor, cohere_model = models["cohere"]
-    backends = {"cohere": CohereBackend(gpu_lock, processor, cohere_model)}
+    cohere_processor, cohere_model = models["cohere"]
+    backends = {"cohere": CohereBackend(gpu_lock, cohere_processor, cohere_model)}
     transcriber = Transcriber(backends, translator, processor, room, audio_source)
     pipeline_workers = [asyncio.create_task(transcriber.run_pipeline(name)) for name in backends]
     translation_worker = asyncio.create_task(transcriber.run_translations())
