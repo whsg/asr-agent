@@ -5,7 +5,7 @@ the text back to the speaker as data messages:
 
   topic "<backend>-transcript": {"type": "interim" | "final", "id": str, "text": str}
 
-Finished utterances are translated to German with TranslateGemma:
+Finished utterances are translated to German with Qwen3:
 
   topic "asr-translation": {"type": "translation", "id": str, "text": str}
 
@@ -24,6 +24,7 @@ import logging
 import os
 import secrets
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -48,9 +49,20 @@ COHERE_MODEL_NAME = os.getenv("COHERE_MODEL", "CohereLabs/cohere-transcribe-arab
 COHERE_4BIT = os.getenv("COHERE_4BIT", "").strip().lower() in ("1", "true", "yes", "on")
 COHERE_LANGUAGE = os.getenv("COHERE_LANGUAGE", "ar").strip() or "ar"
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
-GEMMA_TRANSLATION_MODEL = os.getenv("GEMMA_TRANSLATION_MODEL", "google/translategemma-12b-it")
+TRANSLATION_MODEL = os.getenv("TRANSLATION_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 TRANSLATION_SOURCE_LANG = os.getenv("TRANSLATION_SOURCE_LANG", "ar").strip() or "ar"
 TRANSLATION_TARGET_LANG = os.getenv("TRANSLATION_TARGET_LANG", "de").strip() or "de"
+# System prompt for the translator. The default is tuned for a Friday sermon
+# (Jumu'ah khutba); set to an empty value for the plain "translate, no
+# explanation" prompt.
+TRANSLATION_SYSTEM_PROMPT = (
+    "You are a professional simultaneous interpreter rendering a Friday sermon "
+    "(Jumu'ah khutba) from {src} to {tgt}. The input arrives in short spoken "
+    "fragments and may end mid-sentence: render each one faithfully, keep the "
+    "solemn sermon register, keep proper names and Qur'anic phrases in their "
+    "standard transliteration, and stay consistent with the earlier turns "
+    "shown above. Return only the translation, with no explanation."
+).format(src=TRANSLATION_SOURCE_LANG, tgt=TRANSLATION_TARGET_LANG)
 AUDIO_SAMPLE_RATE = 24_000
 AUDIO_FRAME_SAMPLES = AUDIO_SAMPLE_RATE // 50
 
@@ -108,8 +120,16 @@ F5_REF_WAV = os.getenv("F5_REF_WAV", "").strip()
 F5_REF_TEXT = os.getenv("F5_REF_TEXT", "").strip()
 # Load EMA weights (recommended for the fully fine-tuned checkpoints).
 F5_USE_EMA = os.getenv("F5_USE_EMA", "1").strip().lower() in ("1", "true", "yes", "on")
-# ODE inference steps (lower is faster, 32 is the F5-TTS default).
-F5_NFE_STEPS = _env_int("F5_NFE_STEPS", 32)
+# ODE inference steps (lower is much faster; 8 is a good speed/quality balance,
+# 32 is the F5-TTS default and the slowest).
+F5_NFE_STEPS = _env_int("F5_NFE_STEPS", 8)
+# Max tokens the ASR / translator may generate per pass. A 12 s utterance
+# transcribes to well under 100 tokens, so a tight cap guards against runaway
+# generation while keeping normal turns unaffected.
+MAX_GEN_TOKENS = _env_int("MAX_GEN_TOKENS", 256)
+# How many previous (source, translation) pairs to send as chat context so the
+# translator stays consistent across turns (0 disables the context).
+TRANSLATION_CONTEXT_TURNS = _env_int("TRANSLATION_CONTEXT_TURNS", 6)
 
 # XTTS-v2 (only used when TTS_BACKEND=xtts).
 XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
@@ -120,7 +140,10 @@ VAD_CHUNK = 512  # Silero VAD requires exactly 32 ms windows at 16 kHz
 CHUNK_SECONDS = VAD_CHUNK / SAMPLE_RATE
 SPEECH_START_PROB = 0.5
 SPEECH_KEEP_PROB = 0.35
-END_SILENCE_CHUNKS = round(0.55 / CHUNK_SECONDS)
+# Trailing silence that ends an utterance (env END_SILENCE_SECONDS, default 0.4 s).
+# Lower responds faster; too low can split a mid-sentence pause into two turns.
+END_SILENCE_SECONDS = _env_seconds("END_SILENCE_SECONDS", 0.4)
+END_SILENCE_CHUNKS = round(END_SILENCE_SECONDS / CHUNK_SECONDS)
 PRE_ROLL_CHUNKS = round(0.25 / CHUNK_SECONDS)
 TAIL_CHUNKS = round(0.15 / CHUNK_SECONDS)
 MIN_SPEECH_CHUNKS = round(0.25 / CHUNK_SECONDS)
@@ -263,10 +286,18 @@ def cohere_transcribe(processor, model, audio: np.ndarray) -> str:
     inputs = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt", language=COHERE_LANGUAGE)
     inputs = inputs.to(model.device, dtype=model.dtype)
     with torch.inference_mode():
-        outputs = model.generate(**inputs, max_new_tokens=256)
+        start = time.perf_counter()
+        outputs = model.generate(**inputs, max_new_tokens=MAX_GEN_TOKENS)
+    ms = (time.perf_counter() - start) * 1000
     decoded = processor.decode(outputs, skip_special_tokens=True)
     if isinstance(decoded, list):
         decoded = decoded[0] if decoded else ""
+    # Encoder-decoder ASR models have no input_ids (audio features only) and
+    # generate() returns decoder tokens only; decoder-only models prepend the
+    # prompt, so subtract its length when present.
+    input_ids = inputs.get("input_ids")
+    prompt_len = input_ids.shape[1] if input_ids is not None else 0
+    logger.info("ASR %.0f ms (%d out tokens)", ms, outputs.shape[1] - prompt_len)
     return decoded.strip()
 
 
@@ -317,70 +348,76 @@ def _bits_and_bytes_4bit(dtype):
     )
 
 
-def load_translategemma(dtype, device_map):
-    """Loads the 4-bit TranslateGemma model set by GEMMA_TRANSLATION_MODEL (gated repo).
+def load_qwen3(dtype, device_map):
+    """Loads the 4-bit Qwen3 translator set by TRANSLATION_MODEL.
 
-    Both the 12B (default) and the smaller/faster 4B variants share the same
-    architecture and chat template, so switching sizes is a one-line env change.
+    Qwen3 is a decoder-only chat model with a built-in chat template, so no
+    external Jinja template is needed. The 4B default is a good speed/VRAM fit
+    for a T4; set TRANSLATION_MODEL to an 8B variant for better quality.
     """
-    from transformers import AutoModelForImageTextToText, AutoProcessor
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     load_kwargs = {}
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
-    processor = AutoProcessor.from_pretrained(GEMMA_TRANSLATION_MODEL, **load_kwargs)
-    from huggingface_hub import hf_hub_download
-
-    template_path = hf_hub_download(
-        repo_id=GEMMA_TRANSLATION_MODEL,
-        filename="chat_template.jinja",
-        **load_kwargs,
-    )
-    chat_encoder = processor if getattr(processor, "chat_template", None) else getattr(processor, "tokenizer", processor)
-    if not getattr(chat_encoder, "chat_template", None):
-        chat_encoder.chat_template = Path(template_path).read_text(encoding="utf-8")
-    model = AutoModelForImageTextToText.from_pretrained(
-        GEMMA_TRANSLATION_MODEL,
+    tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL, **load_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(
+        TRANSLATION_MODEL,
         quantization_config=_bits_and_bytes_4bit(dtype),
         device_map="auto",
         **load_kwargs,
     )
     model.eval()
-    return model, processor
+    return model, tokenizer
 
 
-def _translate_text_translategemma(model, processor, text: str) -> str:
-    # TranslateGemma uses one user turn carrying the language codes and text.
-    messages = [
+def _translate_text_qwen3(model, tokenizer, text: str, context: list[tuple[str, str]] = ()) -> str:
+    if TRANSLATION_SYSTEM_PROMPT:
+        messages = [{"role": "system", "content": TRANSLATION_SYSTEM_PROMPT}]
+        messages += [
+            {"role": "user", "content": previous}
+            for previous, _ in context
+        ] + [
+            {"role": "assistant", "content": target}
+            for _, target in context
+        ]
+    else:
+        messages = []
+    messages.append(
         {
             "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "source_lang_code": TRANSLATION_SOURCE_LANG,
-                    "target_lang_code": TRANSLATION_TARGET_LANG,
-                    "text": text,
-                }
-            ],
+            "content": (
+                f"Translate the following text from {TRANSLATION_SOURCE_LANG} to "
+                f"{TRANSLATION_TARGET_LANG}. Return only the translation, with no "
+                f"explanation.\n\n{text}"
+            ),
         }
-    ]
-    chat_encoder = processor if getattr(processor, "chat_template", None) else processor.tokenizer
-    inputs = chat_encoder.apply_chat_template(
+    )
+    # enable_thinking=False: some Qwen3 instruct models (e.g. Qwen3-8B) think
+    # with a reasoning block by default, which is slow and can eat the whole
+    # output budget before reaching the translation. We only ever want the
+    # direct translation, so force thinking off. Harmless for templates without
+    # a thinking branch (e.g. Qwen3-4B-Instruct-2507), which ignore the kwarg.
+    inputs = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=True,
+        enable_thinking=False,
         return_dict=True,
         return_tensors="pt",
     ).to(model.device)
     input_len = inputs["input_ids"].shape[1]
     with torch.inference_mode():
-        output = model.generate(**inputs, max_new_tokens=256, do_sample=False)
+        start = time.perf_counter()
+        output = model.generate(**inputs, max_new_tokens=MAX_GEN_TOKENS, do_sample=False)
+    ms = (time.perf_counter() - start) * 1000
     generated = output[0, input_len:]
-    return processor.decode(generated, skip_special_tokens=True).strip()
+    logger.info("Translate %.0f ms (%d out tokens)", ms, generated.shape[0])
+    return tokenizer.decode(generated, skip_special_tokens=True).strip()
 
 
-def translate_text(model, processor, text: str) -> str:
-    return _translate_text_translategemma(model, processor, text)
+def translate_text(model, tokenizer, text: str, context: list[tuple[str, str]] = ()) -> str:
+    return _translate_text_qwen3(model, tokenizer, text, context)
 
 
 class SpeechSynthesizer:
@@ -443,6 +480,11 @@ def _resolve_f5_ref_wav() -> str:
     return str(path)
 
 
+# Shared F5-TTS model cache: built once (e.g. by the startup preload) and reused
+# by every F5Synthesizer instance so the heavy load happens only once.
+_F5_TTS_MODEL = None
+
+
 class F5Synthesizer:
     """F5-TTS voice (default engine).
 
@@ -456,6 +498,7 @@ class F5Synthesizer:
         self.ref_wav = ""
 
     def _load(self):
+        global _F5_TTS_MODEL
         if self.model is not None:
             return self.model
         from f5_tts.api import F5TTS
@@ -476,6 +519,10 @@ class F5Synthesizer:
             )
         self.ref_wav = _resolve_f5_ref_wav()
 
+        if _F5_TTS_MODEL is not None:
+            self.model = _F5_TTS_MODEL
+            return self.model
+
         if TRANSLATION_TARGET_LANG.strip().lower() == "de":
             logger.info("Loading F5-TTS: German fine-tune %s (%s) ...", F5_GERMAN_REPO, F5_GERMAN_CKPT)
             ckpt_file = hf_hub_download(repo_id=F5_GERMAN_REPO, filename=F5_GERMAN_CKPT)
@@ -493,10 +540,12 @@ class F5Synthesizer:
             use_ema=F5_USE_EMA,
             device="cuda:0" if torch.cuda.is_available() else "cpu",
         )
+        _F5_TTS_MODEL = self.model
         return self.model
 
     def synthesize(self, text: str) -> np.ndarray:
         model = self._load()
+        start = time.perf_counter()
         wav, _sample_rate, _spectrogram = model.infer(
             ref_file=self.ref_wav,
             ref_text=F5_REF_TEXT,
@@ -505,9 +554,13 @@ class F5Synthesizer:
             progress=None,
             nfe_step=F5_NFE_STEPS,
         )
+        ms = (time.perf_counter() - start) * 1000
         if wav is None:
+            logger.info("TTS %.0f ms (no audio produced)", ms)
             return np.zeros(0, dtype=np.float32)
-        return np.asarray(wav, dtype=np.float32).reshape(-1)
+        audio = np.asarray(wav, dtype=np.float32).reshape(-1)
+        logger.info("TTS %.0f ms (%.1f s audio)", ms, audio.size / AUDIO_SAMPLE_RATE)
+        return audio
 
 
 def prepare_models():
@@ -519,10 +572,24 @@ def prepare_models():
     cohere_transcribe(*models["cohere"], warmup)  # Warm-up
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    logger.info("Loading TranslateGemma %s in 4-bit", GEMMA_TRANSLATION_MODEL)
-    translator, processor = load_translategemma(dtype, device_map)
+    logger.info("Loading Qwen3 %s in 4-bit", TRANSLATION_MODEL)
+    translator, tokenizer = load_qwen3(dtype, device_map)
+    try:
+        translate_text(translator, tokenizer, "warm-up")  # Warm Qwen3's first inference
+    except Exception:
+        logger.exception("Qwen3 warm-up failed (non-fatal)")
     load_silero_vad()
-    return models, translator, processor
+    if TTS_BACKEND == "f5" and F5_REF_WAV and F5_REF_TEXT:
+        logger.info("Preloading F5-TTS so the first spoken turn is fast ...")
+        speech = F5Synthesizer()
+        speech._load()
+        try:
+            speech.synthesize("warm-up")  # Warm F5's first inference once
+        except Exception:
+            logger.exception("F5-TTS warm-up failed (non-fatal)")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return models, translator, tokenizer
 
 
 def ws_url(url: str) -> str:
@@ -592,7 +659,16 @@ class Transcriber:
         self.audio_source = audio_source
         self.speech = SpeechSynthesizer()
         self.speakers: dict[str, Speaker] = {}
-        self.translation_jobs: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
+        # (identity, utterance_id, text, enqueued_at) jobs for translate + TTS.
+        self.translation_jobs: asyncio.Queue[tuple[str, str, str, float]] = asyncio.Queue()
+        # >0 while a TTS job is running; live captions then skip so they cannot
+        # delay the spoken reply on the shared GPU.
+        self._tts_in_flight = 0
+        # Recent (source, translation) pairs, sent to the translator as chat
+        # context so consecutive fragments form a coherent sermon rendering.
+        self.translation_context: collections.deque[tuple[str, str]] = collections.deque(
+            maxlen=TRANSLATION_CONTEXT_TURNS
+        )
         self.audio_enabled: dict[str, bool] = {}
         self.gpu_lock = next(iter(backends.values())).gpu_lock
 
@@ -603,14 +679,25 @@ class Transcriber:
             state.wake.clear()
             if state.finals:
                 identity, utterance_id, audio = state.finals.popleft()
+                t0 = time.monotonic()
                 text = await self.backends[name].transcribe(audio) if audio is not None else ""
+                logger.info(
+                    "Final ASR for %s after %.1f s (lock wait + inference)",
+                    identity,
+                    time.monotonic() - t0,
+                )
                 await self._send(identity, "final", utterance_id, text or "", topic)
                 if text:
-                    await self.translation_jobs.put((identity, utterance_id, text))
+                    await self.translation_jobs.put((identity, utterance_id, text, time.monotonic()))
                 continue
 
             speaker = self._next_interim(name)
             if speaker is None:
+                await state.wake.wait()
+                continue
+            if self.translation_jobs.qsize() or self._tts_in_flight:
+                # A reply is already queued or being spoken: skip the live
+                # caption so it cannot push the answer further down the queue.
                 await state.wake.wait()
                 continue
             utterance_id = speaker.utterance_id
@@ -622,23 +709,37 @@ class Transcriber:
 
     async def run_translations(self) -> None:
         while True:
-            identity, utterance_id, source_text = await self.translation_jobs.get()
+            identity, utterance_id, source_text, enqueued_at = await self.translation_jobs.get()
+            started = time.monotonic()
+            waveform = None
             try:
                 async with self.gpu_lock:
                     translated = await asyncio.to_thread(
-                        translate_text, self.translator, self.processor, source_text
+                        translate_text,
+                        self.translator,
+                        self.processor,
+                        source_text,
+                        list(self.translation_context),
                     )
                     if not translated:
                         continue
+                    self.translation_context.append((source_text, translated))
                     await self._send(identity, "translation", utterance_id, translated, TRANSLATION_TOPIC)
                     wants_audio = self.audio_enabled.get(identity, False)
-                    waveform = (
-                        await asyncio.to_thread(self.speech.synthesize, translated)
-                        if wants_audio
-                        else None
-                    )
+                    if wants_audio:
+                        self._tts_in_flight += 1
+                        try:
+                            waveform = await asyncio.to_thread(self.speech.synthesize, translated)
+                        finally:
+                            self._tts_in_flight -= 1
                 if waveform is not None:
                     await self._publish_audio(waveform)
+                logger.info(
+                    "Turn for %s ready in %.1f s (%.1f s queued before the GPU)",
+                    identity,
+                    time.monotonic() - started,
+                    started - enqueued_at,
+                )
             except Exception:
                 logger.exception("Translation or speech output for %s failed", identity)
             finally:
@@ -798,7 +899,7 @@ async def main() -> None:
         raise SystemExit(f"LiveKit rejected the credentials or is not reachable: {exc}")
     logger.info("LiveKit credentials are valid.")
     logger.info("ASR model: %s", COHERE_MODEL_NAME)
-    logger.info("Translation model: %s", GEMMA_TRANSLATION_MODEL)
+    logger.info("Translation model: %s", TRANSLATION_MODEL)
     if TTS_BACKEND == "f5":
         if not F5_REF_WAV or not F5_REF_TEXT:
             logger.warning(
@@ -807,10 +908,12 @@ async def main() -> None:
                 "(or set TTS_BACKEND=xtts)."
             )
         else:
-            logger.info("TTS backend: f5 (reference voice: %s)", F5_REF_WAV)
+            logger.info("TTS backend: f5 (reference voice: %s, ODE steps: %d)", F5_REF_WAV, F5_NFE_STEPS)
     else:
         logger.info("TTS backend: xtts")
     logger.info("Max utterance length: %.2f s", MAX_UTTERANCE_SECONDS)
+    logger.info("End-of-speech silence: %.2f s", END_SILENCE_SECONDS)
+    logger.info("Max generated tokens per pass: %d", MAX_GEN_TOKENS)
     if not HF_TOKEN:
         logger.warning("Cohere ASR is enabled but HF_TOKEN is missing - the repo is gated, so loading will fail.")
 
