@@ -70,8 +70,9 @@
         <strong>Google Colab</strong>. The bot cuts the audio into sentences with a a
         Silero-VAD thread per speaker and transcribes every utterance with
         <strong>Cohere Transcribe Arabic</strong>. The Arabic text is translated to German by
-        <strong>Qwen3-4B-Instruct</strong> in fp16 and spoken by <strong>MOSS-TTS</strong>
-        (Apache-2.0, built-in German voice). Every stage is an independent worker, so the
+        <strong>Qwen3-4B-Instruct</strong> in fp16 (TranslateGemma 12B on Kaggle) and spoken by
+        <strong>Gradium Phonon</strong> on the CPU (German model CC BY-NC 4.0: not for commercial
+        use without an agreement with Gradium). Every stage is an independent worker, so the
         transcript, the translation and the speech stream back in near real time.
       </p>
 
@@ -85,8 +86,8 @@
           <p>The transport. Carries the audio track to the bot and the per-backend transcript data messages, the translation, and the optional TTS audio back to the browser.</p>
         </div>
         <div class="card">
-          <h3>🤖 Colab (A100 recommended for MOSS)</h3>
-          <p><code>bot.py</code>: VAD threads + Cohere ASR + fp16 Qwen3 translator + MOSS-TTS spoken output, run as a streaming pipeline; <code>TTS_BACKEND=xtts</code> selects XTTS-v2 instead.</p>
+          <h3>🤖 Colab T4 / Kaggle T4 ×2</h3>
+          <p><code>bot.py</code>: VAD threads + Cohere ASR + translator on the GPU + Phonon spoken output on the CPU, run as a streaming pipeline; <code>TTS_BACKEND=xtts</code> selects XTTS-v2 instead.</p>
         </div>
       </div>
 
@@ -104,7 +105,7 @@
             SEGC["Silero VAD<br/>shared sentence splitter"]
             ASRC["Cohere Transcribe Arabic<br/>cohere-transcript"]
             TR["Qwen3-4B-Instruct (fp16)<br/>token streaming"]
-            TTS["MOSS-TTS (default), XTTS-v2 fallback<br/>German speech (opt.)"]
+            TTS["Phonon on the CPU (default), XTTS-v2 fallback<br/>German speech (opt.)"]
             SEGC --> ASRC
             ASRC --> TR
             TR --> TTS
@@ -155,13 +156,13 @@
       <h2>Running it</h2>
       <p>
         You need two things: a <strong>LiveKit Cloud account</strong> (Project &rarr; API keys) and
-        a <strong>Google Colab</strong> account with a larger GPU for MOSS
-        (A100 40 GB recommended; the default stack cannot fit a T4). Then:
+        a <strong>Google Colab</strong> account (a free T4 GPU is enough; Kaggle's T4 ×2
+        notebook runs TranslateGemma 12B). Then:
       </p>
       <ol>
         <li>
           <strong>Start the bot in Colab.</strong> In <code>colab_agent.ipynb</code> set the
-          runtime to <em>Runtime &gt; Change runtime type &gt; A100 GPU</em>, then
+          runtime to <em>Runtime &gt; Change runtime type &gt; T4 GPU</em>, then
           <em>Runtime &gt; Run all</em>. The first cell asks you to upload your
           <code>.env</code> file (copy <code>.env.example</code>, fill in the three LiveKit keys
           &mdash; more below). The install cell adds the extra packages automatically.
@@ -171,26 +172,24 @@
         <li>
           <strong>Configure the <code>.env</code></strong> with the LiveKit credentials
           (<code>LIVEKIT_URL</code>, <code>LIVEKIT_API_KEY</code>, <code>LIVEKIT_API_SECRET</code>)
-          and a Hugging Face <code>HF_TOKEN</code> with access to the gated Cohere repository:
+          and a Hugging Face <code>HF_TOKEN</code> with access to the gated repositories:
           <ul>
-            <li><strong>Gated model:</strong> accept the terms for Cohere Transcribe Arabic on Hugging Face, then add an authorized <code>HF_TOKEN</code> to the <code>.env</code>. Qwen3 and MOSS-TTS are open and need no token.</li>
+            <li><strong>Gated models:</strong> accept the terms for Cohere Transcribe Arabic and Phonon German (<code>gradium/phonon-40m-de</code>) on Hugging Face, then add an authorized <code>HF_TOKEN</code> to the <code>.env</code>. Qwen3 is public.</li>
             <li><code>COHERE_4BIT=1</code> &mdash; optional; 4-bit-quantizes the Cohere ASR model to free VRAM for the fp16 translator.</li>
             <li><code>TRANSLATION_MODEL</code> &mdash; <code>Qwen/Qwen3-4B-Instruct-2507</code> by default; an 8B variant translates better but decodes slower.</li>
-            <li><strong>Spoken German output needs no configuration</strong> &mdash; MOSS-TTS has a
-            built-in voice, so just enable "German speech output" in the web app. Set
-            <code>MOSS_REF_WAV</code> only to clone a specific voice, or
+            <li><strong>Spoken German output needs no configuration</strong> &mdash; Phonon uses the
+            German model's default voice, so just enable "German speech output" in the web app. Set
+            <code>PHONON_VOICE</code> for another catalog voice, or
             <code>TTS_BACKEND=xtts</code> for XTTS-v2
             (<code>XTTS_SPEAKER</code> / <code>XTTS_SPEAKER_WAV</code>).</li>
-            <li>Other overrides: <code>LIVEKIT_ROOM</code>, <code>COHERE_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>MOSS_VQ_DEPTH</code> (TTS speed/quality dial), <code>MIN_SENTENCE_SECONDS</code>, <code>MAX_UTTERANCE_SECONDS</code> (default 12 s, longer utterances are split).</li>
+            <li>Other overrides: <code>LIVEKIT_ROOM</code>, <code>COHERE_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>MIN_SENTENCE_SECONDS</code>, <code>MAX_UTTERANCE_SECONDS</code> (default 12 s, longer utterances are split).</li>
           </ul>
         </li>
         <li>
-          <strong>VRAM budget:</strong> The current MOSS Local checkpoint has 3.06B parameters,
-          plus a separate 1.77B float32 audio codec. With ASR and the full-precision
-          translator, weights alone need about 23.7 GiB, before inference memory.
-          Use a larger GPU (32 GiB+ recommended; e.g. A100 40 GB).
-          Startup checks known weight requirements before downloading models,
-          loads ASR, then TTS/codec, then the translator, and requires successful warm-ups.
+          <strong>VRAM budget:</strong> Cohere ASR (3.85 GiB) and the fp16 Qwen3 translator
+          (7.49 GiB) use about 11.3 GiB of a T4's 15 GiB, before inference memory; Phonon
+          runs on the CPU and needs no GPU memory. Startup loads ASR, then the TTS, then
+          the translator, and requires successful warm-ups.
           The last cell saves output to <code>/content/bot.log</code>; installation
           output is in <code>/content/install.log</code>.
         </li>

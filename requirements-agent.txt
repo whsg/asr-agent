@@ -13,8 +13,7 @@ torchaudio
 librosa
 sentencepiece
 protobuf
-einops
-tiktoken
 # TTS_BACKEND=xtts only: pip install 'coqui-tts>=0.27'
-# MOSS loads model and codec code via transformers trust_remote_code.
+ptts
+# Phonon is the default TTS; its German model is CC BY-NC 4.0.
 # Keep torch and torchaudio on matching releases (Colab pins its installed torch).

@@ -73,26 +73,6 @@ def test_kaggle_install_keeps_preinstalled_torch_stack(tmp_path):
         f"{name}=={version}\n" for name, version in versions.items())
 
 
-def test_kaggle_install_isolates_moss_transformers(tmp_path):
-    envs = {}
-    commands, _ = run_kaggle_install_cell(tmp_path, envs=envs)
-    moss_call = next(c for c in commands if "--target" in c)
-    assert "transformers==5.3.0" in moss_call
-    assert "--no-deps" in moss_call, "5.3.0 must reuse the shared deps, not replace them"
-    site = moss_call[moss_call.index("--target") + 1]
-    assert site == str(tmp_path / "moss-transformers")
-
-    check = next(c for c in commands if c[1] == "-c" and "MOSS-Audio-Tokenizer" in c[2])
-    assert "transformers.__version__ == '5.3.0'" in check[2]
-    assert "AutoConfig.from_pretrained('OpenMOSS-Team/MOSS-Audio-Tokenizer'" in check[2]
-    assert envs[id(check)]["PYTHONPATH"] == site, "the MOSS check must see the isolated transformers"
-    main_check = next(c for c in commands if c[1] == "-c" and "CohereAsrForConditionalGeneration" in c[2])
-    assert "PYTHONPATH" not in envs[id(main_check)], "the main process must keep transformers 5.4.0"
-
-    profile = "".join(kaggle_cells()[2]["source"])
-    assert "'TTS_WORKER_PYTHONPATH': '/kaggle/working/moss-transformers'" in profile
-
-
 def test_kaggle_install_reports_missing_internet_before_pip(tmp_path):
     def offline(*args, **kwargs):
         raise OSError("[Errno -3] Temporary failure in name resolution")
@@ -137,20 +117,59 @@ def test_kaggle_notebook_embeds_agent_and_compiles():
         compile(code, "kaggle-cell", "exec")
 
 
-def test_kaggle_profile_has_two_devices_and_quantized_gemma():
+def kaggle_literal(name):
     tree = ast.parse("".join(kaggle_cells()[2]["source"]))
-    assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
-                      and any(isinstance(target, ast.Name) and target.id == "PROFILE"
-                              for target in node.targets))
-    profile = ast.literal_eval(assignment.value)
-    assert profile["ASR_DEVICE"] == profile["TRANSLATION_DEVICE"] == "cuda:0"
-    assert profile["TTS_DEVICE"] == "cuda:1"
+    node = next(node for node in tree.body if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == name for target in node.targets))
+    return ast.literal_eval(node.value)
+
+
+def test_kaggle_profile_splits_gpus_and_runs_phonon_on_cpu():
+    profile = kaggle_literal("PROFILE")
+    # ASR and translation on separate GPUs: separate queues, so they overlap.
+    assert profile["ASR_DEVICE"] == "cuda:1" and profile["TRANSLATION_DEVICE"] == "cuda:0"
     assert profile["TRANSLATION_MODEL"] == "google/translategemma-12b-it"
     assert profile["TRANSLATION_BACKEND"] == "translategemma"
     assert profile["TRANSLATION_4BIT"] == "1"
     assert profile["TRANSLATION_CONTEXT_TURNS"] == "0"
     assert profile["GPU_CONCURRENCY"] == "1"
-    assert profile["TTS_BACKEND"] == "moss"
+    assert profile["TTS_BACKEND"] == "phonon" and profile["TTS_DEVICE"] == "cpu"
+    assert profile["PHONON_MODEL"] == "hf://gradium/phonon-40m-de"
+    install = "".join(kaggle_cells()[1]["source"])
+    assert "'ptts'" in install and "import ptts" in install
+    notebook = (ROOT / "kaggle_agent.ipynb").read_text().lower()
+    assert "moss" not in notebook, "MOSS was removed"
+
+
+def test_kaggle_access_check_covers_all_gated_models():
+    """The gated models must fail fast, before tens of GB are downloaded."""
+    tree = ast.parse("".join(kaggle_cells()[2]["source"]))
+    start = next(i for i, n in enumerate(tree.body) if isinstance(n, ast.Assign)
+                 and any(getattr(t, "id", None) == "ACCESS_REPOS" for t in n.targets))
+    calls = []
+    namespace = {"PROFILE": kaggle_literal("PROFILE"),
+                 "run_logged": lambda arguments, log_name, **kwargs: calls.append(arguments)}
+    for node in tree.body[start:]:
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "access", "exec"), namespace)
+        if calls:
+            break
+    assert calls[0][2:] == ["CohereLabs/cohere-transcribe-arabic-07-2026",
+                            "google/translategemma-12b-it", "gradium/phonon-40m-de"]
+    compile(calls[0][1], "access-check", "exec")
+
+
+def test_phonon_default_puts_tts_on_its_own_cpu_scheduler():
+    """Without TTS_DEVICE, Phonon must not queue behind the GPU 0 slot."""
+    import subprocess
+
+    code = (
+        "import os, sys; sys.path.insert(0, %r); import stubs; stubs.install(); "
+        "os.environ.pop('TTS_DEVICE', None); os.environ.pop('TTS_BACKEND', None); "
+        "sys.path.insert(0, %r); import bot; print(bot.TTS_BACKEND, bot.TTS_DEVICE)"
+    ) % (str(ROOT / "test"), str(ROOT))
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[-2:] == ["phonon", "cpu"]
 
 
 def test_explicit_device_placement_and_dtype(bot, monkeypatch):
@@ -165,17 +184,6 @@ def test_explicit_device_placement_and_dtype(bot, monkeypatch):
         bot.pick_device_dtype("cuda:2")
     with pytest.raises(ValueError, match="Invalid device"):
         bot.pick_device_dtype("gpu1")
-
-
-def test_moss_floor_is_per_device_not_total_across_gpus(bot, monkeypatch):
-    dual_gpu(bot, monkeypatch)
-    monkeypatch.setattr(bot, "MOSS_DTYPE", "float16")
-    monkeypatch.setattr(bot, "TTS_BACKEND", "moss")
-    monkeypatch.setattr(bot, "TRANSLATION_MODEL", "google/translategemma-12b-it")
-    bot._check_moss_memory(bot.torch.float16, "cuda:0")
-    monkeypatch.setattr(bot, "TTS_DEVICE", "cuda:0")
-    with pytest.raises(RuntimeError, match="cannot fit a T4"):
-        bot._check_moss_memory(bot.torch.float16, "cuda:0")
 
 
 def test_device_schedulers_allow_tts_during_translation(bot, monkeypatch):
@@ -213,51 +221,6 @@ def test_vram_report_uses_selected_gpu(bot, monkeypatch, caplog):
         bot._vram_report("TTS", "cuda:1")
     assert calls == [1]
     assert "cuda:1" in caplog.text
-
-
-def test_moss_model_and_codec_both_load_on_gpu_one(bot, monkeypatch):
-    dual_gpu(bot, monkeypatch)
-    calls = {}
-
-    class Codec:
-        def to(self, device):
-            calls["codec_device"] = device
-            return self
-
-        def eval(self):
-            return self
-
-    def load_model(model_id, **kwargs):
-        calls["model_kwargs"] = kwargs
-        calls["model"] = SimpleNamespace(
-            eval=lambda: None, generation_config=SimpleNamespace(cache_implementation=None))
-        return calls["model"]
-
-    def load_processor(model_id, **kwargs):
-        # MOSS's real processor forwards unknown kwargs into ProcessorMixin,
-        # which rejects them ("Unexpected keyword argument token").
-        unexpected = set(kwargs) - {"trust_remote_code"}
-        if unexpected:
-            raise TypeError(f"Unexpected keyword argument {', '.join(sorted(unexpected))}.")
-        return SimpleNamespace(audio_tokenizer=Codec(), model_config=SimpleNamespace(sampling_rate=24_000))
-
-    monkeypatch.setattr(bot.torch, "backends", SimpleNamespace(
-        cuda=SimpleNamespace(enable_cudnn_sdp=lambda enabled: None)), raising=False)
-    monkeypatch.setattr(bot, "MOSS_DTYPE", "auto")
-    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
-        __version__="5.4.0",
-        AutoProcessor=SimpleNamespace(from_pretrained=load_processor),
-        AutoModel=SimpleNamespace(from_pretrained=load_model),
-    ))
-    engine = bot.MossSynthesizer()
-    engine.load()
-    assert calls["codec_device"] == "cuda:1"
-    assert calls["model_kwargs"]["device_map"] == {"": 1}
-    assert calls["model_kwargs"]["dtype"] == bot.torch.float16
-    assert engine.sample_rate == 24_000
-    # Without this, transformers 5.3.0 builds DynamicCache(config=...) and
-    # MOSS fails with "'MossTTSDelayConfig' object has no attribute 'num_hidden_layers'".
-    assert calls["model"].generation_config.cache_implementation == "dynamic_full"
 
 
 @pytest.mark.parametrize("prompt_length", [30, 2049])
@@ -499,7 +462,7 @@ def test_smoke_test_uses_supplied_arabic_audio(bot, monkeypatch, tmp_path, input
 
 def test_kaggle_runner_puts_child_traceback_into_error(tmp_path):
     output = (
-        "INFO Loading MOSS-TTS ...\n"
+        "INFO Loading Phonon ...\n"
         "Traceback (most recent call last):\n"
         '  File "bot.py", line 1, in <module>\n'
         "torch.OutOfMemoryError: CUDA out of memory on cuda:1\n"
@@ -529,7 +492,7 @@ def test_kaggle_runner_puts_child_traceback_into_error(tmp_path):
     message = str(error.value)
     assert "CUDA out of memory on cuda:1" in message
     assert message.index("Traceback (most recent") < message.index("CUDA out of memory")
-    assert "Loading MOSS" not in message.split("--- Cause ---")[1]
+    assert "Loading Phonon" not in message.split("--- Cause ---")[1]
 
 
 @pytest.mark.parametrize("exit_code, live, should_raise", [(0, False, False), (1, False, True), (0, True, True)])

@@ -16,12 +16,12 @@ The translation is published incrementally while it is generated, and each
 finished clause is spoken immediately instead of waiting for the whole
 sentence, which is what keeps the spoken output close to real time.
 
-Runs on a single GPU. The default MOSS stack requires a larger GPU than a T4.
+Models run on one or more GPUs (see ASR_DEVICE / TRANSLATION_DEVICE); the
+default Phonon TTS runs on the CPU.
 """
 from __future__ import annotations
 
 import asyncio
-import atexit
 import collections
 import contextlib
 import heapq
@@ -32,7 +32,6 @@ import os
 import queue
 import re
 import secrets
-import subprocess
 import sys
 import threading
 import time
@@ -110,7 +109,7 @@ TRANSCRIPT_TOPIC = "cohere-transcript"
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
 ASR_DEVICE = os.getenv("ASR_DEVICE", "auto").strip().lower()
 TRANSLATION_DEVICE = os.getenv("TRANSLATION_DEVICE", "auto").strip().lower()
-TTS_DEVICE = os.getenv("TTS_DEVICE", "auto").strip().lower()
+TTS_DEVICE = os.getenv("TTS_DEVICE", "").strip().lower()
 
 # --- ASR -------------------------------------------------------------------
 COHERE_MODEL_NAME = os.getenv("COHERE_MODEL", "CohereLabs/cohere-transcribe-arabic-07-2026")
@@ -163,35 +162,21 @@ ASR_TOKENS_PER_SECOND = _env_int("ASR_TOKENS_PER_SECOND", 25)
 TRANSLATION_TOKEN_RATIO = _env_positive_float("TRANSLATION_TOKEN_RATIO", 3.0)
 
 # --- TTS -------------------------------------------------------------------
-TTS_BACKEND = os.getenv("TTS_BACKEND", "moss").strip().lower()
-if TTS_BACKEND not in ("moss", "xtts"):
-    logger.warning("Invalid TTS_BACKEND=%r; using 'moss' instead", TTS_BACKEND)
-    TTS_BACKEND = "moss"
+TTS_BACKEND = os.getenv("TTS_BACKEND", "phonon").strip().lower()
+if TTS_BACKEND not in ("phonon", "xtts"):
+    logger.warning("Invalid TTS_BACKEND=%r; using 'phonon' instead", TTS_BACKEND)
+    TTS_BACKEND = "phonon"
+# Phonon synthesises on the CPU, so by default its stage gets its own CPU
+# scheduler instead of waiting for the GPU slot held by ASR/translation.
+TTS_DEVICE = TTS_DEVICE or ("cpu" if TTS_BACKEND == "phonon" else "auto")
 
-# MOSS-TTS (the default). Apache-2.0, and its language list covers German and
-# Arabic. It speaks with a built-in voice, so no reference clip is needed and
-# nothing is re-synthesised per call; a clip can still be supplied via
-# MOSS_REF_WAV to clone a specific voice.
-MOSS_MODEL = os.getenv("MOSS_MODEL", "OpenMOSS-Team/MOSS-TTS-Local-Transformer").strip()
-MOSS_REF_WAV = os.getenv("MOSS_REF_WAV", "").strip()
-# RVQ inference depth (max 32). Lower is faster and less detailed - this is the
-# speed/quality dial.
-MOSS_VQ_DEPTH = _env_int("MOSS_VQ_DEPTH", 32)
-MOSS_TEMPERATURE = _env_positive_float("MOSS_TEMPERATURE", 1.0)
-MOSS_TOP_P = _env_positive_float("MOSS_TOP_P", 0.95)
-MOSS_TOP_K = _env_int("MOSS_TOP_K", 50)
-MOSS_REPETITION_PENALTY = _env_positive_float("MOSS_REPETITION_PENALTY", 1.1)
-# The model card states the audio codec runs at 12.5 tokens per second.
-MOSS_TOKENS_PER_SECOND = 12.5
-# A T4 has no bf16 tensor cores, so the pipeline picks fp16 there. MOSS-TTS is
-# published with a bf16 example; override this if fp16 ever misbehaves.
-MOSS_DTYPE = os.getenv("MOSS_DTYPE", "auto").strip().lower()
 XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
-# When set, the TTS engine runs in its own process with this directory first on
-# its PYTHONPATH. MOSS-TTS's remote code breaks on transformers >= 5.4 (configs
-# became strict dataclasses), while Cohere ASR only exists from 5.4 on, so the
-# Kaggle notebook installs transformers 5.3.0 there for the TTS alone.
-TTS_WORKER_PYTHONPATH = os.getenv("TTS_WORKER_PYTHONPATH", "").strip()
+# Phonon (Gradium): 40M-parameter TTS that runs faster than real time on a CPU,
+# so the TTS needs no GPU at all. The German checkpoint is gated on Hugging Face
+# (accept its terms, then HF_TOKEN) and licensed CC BY-NC 4.0 - NOT for
+# commercial use without an agreement with Gradium. Empty voice = model default.
+PHONON_MODEL = os.getenv("PHONON_MODEL", "hf://gradium/phonon-40m-de").strip()
+PHONON_VOICE = os.getenv("PHONON_VOICE", "").strip()
 
 # Speak each finished clause as soon as the translator has produced it instead
 # of waiting for the full sentence. This is the single biggest win for
@@ -540,8 +525,10 @@ class GpuScheduler:
 
 
 def pick_device_dtype(requested: str = "auto") -> tuple[torch.dtype, str]:
-    if requested == "cpu" or (requested == "auto" and not torch.cuda.is_available()):
-        logger.warning("Using CPU for this stage; model inference will be slow.")
+    if requested == "cpu":
+        return torch.float32, "cpu"
+    if requested == "auto" and not torch.cuda.is_available():
+        logger.warning("No GPU found; this stage runs on the CPU and may be slow.")
         return torch.float32, "cpu"
     device = "cuda:0" if requested in ("auto", "cuda") else requested
     if not re.fullmatch(r"cuda:\d+", device):
@@ -609,46 +596,6 @@ def _device_map(device: str):
     fits on the GPU or raises an OOM we can react to.
     """
     return {"": int(device.split(":")[1])} if device != "cpu" else {"": "cpu"}
-
-
-def _check_moss_memory(dtype, device: str) -> None:
-    """Reject configurations whose known weight floor exceeds the entire GPU."""
-    if TTS_BACKEND != "moss":
-        return
-    if MOSS_MODEL != "OpenMOSS-Team/MOSS-TTS-Local-Transformer":
-        return
-    # Published safetensors metadata, not the "1.7B" architecture label.
-    # The processor loads a separate float32 MOSS-Audio-Tokenizer.
-    tts_dtype, tts_device = pick_device_dtype(TTS_DEVICE)
-    if tts_device == "cpu":
-        return
-    bytes_per_weight = 4 if tts_dtype == torch.float32 else 2
-    moss_bytes = {"auto": bytes_per_weight, "float16": 2, "bfloat16": 2, "float32": 4}
-    if MOSS_DTYPE not in moss_bytes:
-        raise ValueError("MOSS_DTYPE must be auto, float16, bfloat16, or float32.")
-    minimum = 3_060_606_464 * moss_bytes[MOSS_DTYPE] + 1_774_566_400 * 4
-    if device == tts_device and COHERE_MODEL_NAME == "CohereLabs/cohere-transcribe-arabic-07-2026":
-        minimum += 2_065_804_048 * (0.5 if COHERE_4BIT else (4 if dtype == torch.float32 else 2))
-    _, translation_device = pick_device_dtype(TRANSLATION_DEVICE)
-    if translation_device == tts_device and TRANSLATION_MODEL == "Qwen/Qwen3-4B-Instruct-2507":
-        # Even the automatic 4-bit fallback needs at least this much.
-        minimum += 4_022_468_096 * 0.5
-    if translation_device == tts_device and TRANSLATION_MODEL == "google/translategemma-12b-it":
-        minimum += 12_000_000_000 * 0.5
-    total = torch.cuda.get_device_properties(int(tts_device.split(":")[1])).total_memory
-    logger.info(
-        "Known model weight floor on %s: %.1f GiB; GPU total: %.1f GiB. "
-        "Quantization metadata, caches and inference need additional memory.",
-        tts_device, minimum / 2**30, total / 2**30,
-    )
-    if minimum >= total:
-        raise RuntimeError(
-            f"MOSS + codec + configured ASR/translator require at least {minimum / 2**30:.1f} GiB "
-            f"of weights, but this GPU has {total / 2**30:.1f} GiB total. "
-            "This configuration cannot fit a T4. Select a larger GPU "
-            "(32 GiB or more recommended; Colab A100 40 GB), then run all cells. "
-            "No models have been loaded."
-        )
 
 
 def _bf16_works(device: str) -> bool:
@@ -1033,266 +980,53 @@ class XttsSynthesizer:
         return _resample(audio, self.sample_rate, AUDIO_SAMPLE_RATE)
 
 
-class MossSynthesizer:
-    """MOSS-TTS (Apache-2.0).
+class PhononSynthesizer:
+    """Gradium Phonon via its `ptts` Python package (TTS_BACKEND=phonon).
 
-    Its language list covers German and Arabic, and it has a built-in voice:
-    no reference clip is required and none is re-synthesised per call. Setting
-    MOSS_REF_WAV switches it to zero-shot cloning of that voice.
+    Runs on the CPU in its own Rust runtime, so it neither needs a GPU nor
+    competes with the ASR and translator for VRAM.
     """
 
     def __init__(self) -> None:
-        self.model = None
-        self.processor = None
+        self.tts = None
         self.sample_rate = AUDIO_SAMPLE_RATE
-        self._reference: list[str] | None = None
 
     def load(self):
-        if self.model is not None:
-            return self.model
-        from transformers import AutoModel, AutoProcessor
+        if self.tts is not None:
+            return self.tts
+        import ptts
 
-        dtype, device = pick_device_dtype(TTS_DEVICE)
-        if MOSS_DTYPE != "auto":
-            if MOSS_DTYPE not in ("float16", "bfloat16", "float32"):
-                raise ValueError("MOSS_DTYPE must be auto, float16, bfloat16, or float32.")
-            dtype = getattr(torch, MOSS_DTYPE)
-        if dtype == torch.bfloat16 and device != "cpu" and torch.cuda.get_device_capability(int(device.split(":")[1]))[0] < 8:
-            raise ValueError("MOSS_DTYPE=bfloat16 is not supported on a T4; use auto or float32.")
-        if not 1 <= MOSS_VQ_DEPTH <= 32:
-            raise ValueError("MOSS_VQ_DEPTH must be between 1 and 32.")
-        if MOSS_TOP_P > 1:
-            raise ValueError("MOSS_TOP_P must be greater than 0 and at most 1.")
-        if MOSS_REF_WAV and not Path(MOSS_REF_WAV).is_file():
-            raise RuntimeError(f"MOSS reference file not found: {MOSS_REF_WAV}")
-        if device != "cpu":
-            # The model card calls the cuDNN SDPA backend broken and disables
-            # it, keeping the other kernels as fallbacks.
-            torch.backends.cuda.enable_cudnn_sdp(False)
-        attn = "sdpa" if device != "cpu" else "eager"
-        logger.info("Loading MOSS-TTS %s (%s, %s) ...", MOSS_MODEL, dtype, attn)
+        logger.info("Loading Phonon %s (lang %s, voice %s) on the CPU ...",
+                    PHONON_MODEL, TRANSLATION_TARGET_LANG, PHONON_VOICE or "model default")
         try:
-            # No extra kwargs: MOSS's processor forwards every kwarg into its own
-            # constructor, which rejects unknown ones such as `token`. The MOSS
-            # repos are public; downloads still pick up HF_TOKEN from the env.
-            processor = AutoProcessor.from_pretrained(MOSS_MODEL, trust_remote_code=True)
-            # Keep the codec's published float32 dtype; its quantizer explicitly
-            # casts activations to float32. Include it in VRAM planning.
-            processor.audio_tokenizer = processor.audio_tokenizer.to(device).eval()
-            model = AutoModel.from_pretrained(
-                MOSS_MODEL,
-                trust_remote_code=True,
-                token=HF_TOKEN,
-                device_map=_device_map(device),
-                attn_implementation=attn,
-                **_dtype_kwargs(dtype),
-            )
-            model.eval()
-            # transformers 5.3.0 (unlike 5.0.0, which MOSS targets) pre-builds
-            # DynamicCache(config=get_text_config()) for every generate(); MOSS's
-            # top-level config keeps num_hidden_layers inside language_config, so
-            # that raises AttributeError. "dynamic_full" builds a config-free
-            # DynamicCache, as 5.0.0 effectively did. MOSS copies this config on
-            # every generate() call.
-            model.generation_config.cache_implementation = "dynamic_full"
+            self.tts = ptts.TTS(PHONON_MODEL, lang=TRANSLATION_TARGET_LANG)
         except Exception as exc:  # noqa: BLE001 - wrapped with actionable guidance
             raise RuntimeError(
-                f"Could not load MOSS-TTS ({MOSS_MODEL}) and its audio codec: "
-                f"{type(exc).__name__}: {exc} (full traceback above)."
+                f"Could not load Phonon ({PHONON_MODEL}): {type(exc).__name__}: {exc}. "
+                "The Phonon 40m models are gated: accept the terms on the model's Hugging "
+                "Face page with the account whose HF_TOKEN is configured."
             ) from exc
-        self.processor = processor
-        self.model = model
-        self.sample_rate = int(processor.model_config.sampling_rate)
-        if MOSS_REF_WAV:
-            self._reference = [MOSS_REF_WAV]
-            logger.info("MOSS-TTS clones the voice from %s", MOSS_REF_WAV)
-        else:
-            logger.info("MOSS-TTS uses its built-in voice (no reference clip needed)")
-        return self.model
-
-    def _token_budget(self, text: str) -> int:
-        """Audio tokens to allow for this text, with a wide safety margin.
-
-        German is spoken at roughly 14 characters per second; the margin is
-        deliberately large because a budget that bites would clip the end of a
-        sentence, and a finished utterance stops on its own long before it.
-        """
-        seconds = len(text) / 14.0
-        return max(96, int(seconds * MOSS_TOKENS_PER_SECOND * 2.5) + 64)
+        self.sample_rate = int(self.tts.sample_rate)
+        logger.info("Phonon ready (%d Hz); voices: %s", self.sample_rate,
+                    ", ".join(map(str, self.tts.voices)) or "none listed")
+        return self.tts
 
     def synthesize(self, text: str) -> np.ndarray:
-        self.load()
-        message = (
-            self.processor.build_user_message(text=text, reference=self._reference)
-            if self._reference
-            else self.processor.build_user_message(text=text)
-        )
-        batch = self.processor([[message]], mode="generation")
-        device = self.model.device
-        budget = self._token_budget(text)
-        kwargs = {
-            "input_ids": batch["input_ids"].to(device),
-            "attention_mask": batch["attention_mask"].to(device),
-            "max_new_tokens": budget,
-        }
-        tuning = {
-            "n_vq_for_inference": MOSS_VQ_DEPTH,
-            "audio_temperature": MOSS_TEMPERATURE,
-            "audio_top_p": MOSS_TOP_P,
-            "audio_top_k": MOSS_TOP_K,
-            "audio_repetition_penalty": MOSS_REPETITION_PENALTY,
-        }
-        with torch.inference_mode():
-            outputs = self.model.generate(**kwargs, **tuning)
-
-            audio = None
-            for decoded in self.processor.decode(outputs):
-                codes = getattr(decoded, "audio_codes_list", None)
-                if codes:
-                    audio = codes[0]
-                    break
-        if audio is None:
-            raise RuntimeError("MOSS-TTS returned no audio for a non-empty text.")
-        waveform = np.asarray(audio.detach().to(torch.float32).cpu().numpy()).reshape(-1)
-        if waveform.size == 0 or not np.isfinite(waveform).all():
-            raise RuntimeError(
-                "MOSS-TTS returned empty or non-finite audio. If using fp16, "
-                "try MOSS_DTYPE=float32 (requires more GPU memory)."
-            )
-        produced_tokens = waveform.size / self.sample_rate * MOSS_TOKENS_PER_SECOND
-        if produced_tokens >= budget * 0.98:
-            logger.warning(
-                "MOSS-TTS hit its %d-token budget - the audio is probably cut off. "
-                "Report this; the budget is derived from the text length.", budget,
-            )
-        return _resample(waveform, self.sample_rate, AUDIO_SAMPLE_RATE)
-
-
-class TtsWorkerClient:
-    """Runs the TTS engine in a child process (TTS_WORKER_PYTHONPATH).
-
-    The child gets its own transformers version and its own GIL, so MOSS
-    decoding on one GPU never competes with the translator's decode loop for
-    the interpreter. Protocol: one JSON line per request on stdin; one JSON
-    header line, then raw float32 samples, per response on stdout.
-    """
-
-    def __init__(self) -> None:
-        self.process: subprocess.Popen | None = None
-        self.sample_rate = AUDIO_SAMPLE_RATE
-        self.command = [sys.executable, "-u", str(Path(__file__).resolve()), "--tts-worker"]
-
-    def load(self):
-        if self.process is not None:
-            return self.process
-        env = os.environ.copy()
-        env["PYTHONPATH"] = os.pathsep.join(
-            path for path in (TTS_WORKER_PYTHONPATH, env.get("PYTHONPATH", "")) if path
-        )
-        logger.info("Starting the %s TTS worker process (PYTHONPATH %s) ...",
-                    TTS_BACKEND, TTS_WORKER_PYTHONPATH)
-        # stderr is inherited, so the worker's logs and tracebacks appear inline.
-        self.process = subprocess.Popen(
-            self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env,
-        )
-        atexit.register(self.close)
-        header = self._read_header()
-        if not header.get("ok"):
-            raise RuntimeError(f"TTS worker could not load the model: {header.get('error')}")
-        logger.info("TTS worker ready (pid %d, transformers %s)",
-                    self.process.pid, header.get("transformers"))
-        return self.process
-
-    def synthesize(self, text: str) -> np.ndarray:
-        process = self.load()
-        try:
-            process.stdin.write(json.dumps({"text": text}).encode("utf-8") + b"\n")
-            process.stdin.flush()
-        except (BrokenPipeError, OSError) as exc:
-            raise self._died() from exc
-        header = self._read_header()
-        if not header.get("ok"):
-            raise RuntimeError(f"TTS worker failed: {header.get('error')}")
-        size = int(header["bytes"])
-        data = process.stdout.read(size)
-        if len(data) != size:
-            raise self._died()
-        return np.frombuffer(data, dtype=np.float32).copy()
-
-    def _read_header(self) -> dict:
-        line = self.process.stdout.readline()
-        if not line:
-            raise self._died()
-        return json.loads(line)
-
-    def _died(self) -> RuntimeError:
-        code = None
-        if self.process is not None:
-            # EOF can arrive a moment before the exit status is available.
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                code = self.process.wait(timeout=5)
-        return RuntimeError(
-            f"TTS worker process exited (code {code}); its traceback is in the log above."
-        )
-
-    def close(self) -> None:
-        """Ends the worker and waits, so its GPU memory is free afterwards."""
-        process, self.process = self.process, None
-        if process is None:
-            return
-        with contextlib.suppress(OSError):
-            process.stdin.close()
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
-
-
-def run_tts_worker() -> int:
-    """Child-process side of TtsWorkerClient."""
-    # Keep the real stdout for the protocol and send everything else that
-    # libraries print to stderr, so no stray output can corrupt a response.
-    protocol = os.fdopen(os.dup(1), "wb")
-    os.dup2(2, 1)
-
-    def send(header: dict, payload: bytes = b"") -> None:
-        protocol.write(json.dumps(header).encode("utf-8") + b"\n" + payload)
-        protocol.flush()
-
-    try:
-        import transformers
-
-        engine = SpeechSynthesizer._ENGINES[TTS_BACKEND]()
-        engine.load()
-    except Exception as exc:  # noqa: BLE001 - reported to the parent
-        logger.exception("TTS worker failed to load")
-        send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
-        return 1
-    send({"ok": True, "transformers": transformers.__version__})
-    for line in sys.stdin.buffer:
-        try:
-            text = json.loads(line)["text"]
-            audio = np.ascontiguousarray(engine.synthesize(text), dtype=np.float32)
-        except Exception as exc:  # noqa: BLE001 - one failed chunk must not end the worker
-            logger.exception("TTS worker request failed")
-            send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
-            continue
-        data = audio.tobytes()
-        send({"ok": True, "bytes": len(data)}, data)
-    return 0
+        tts = self.load()
+        pcm = tts.synth(text, voice=PHONON_VOICE) if PHONON_VOICE else tts.synth(text)
+        audio = np.asarray(pcm, dtype=np.float32).reshape(-1)
+        if audio.size == 0 or not np.isfinite(audio).all():
+            raise RuntimeError("Phonon returned empty or non-finite audio for a non-empty text.")
+        return _resample(audio, self.sample_rate, AUDIO_SAMPLE_RATE)
 
 
 class SpeechSynthesizer:
     """Spoken output for the translation; the engine is picked by TTS_BACKEND."""
 
-    _ENGINES = {"moss": MossSynthesizer, "xtts": XttsSynthesizer}
+    _ENGINES = {"phonon": PhononSynthesizer, "xtts": XttsSynthesizer}
 
     def __init__(self) -> None:
-        if TTS_WORKER_PYTHONPATH:
-            self.engine = TtsWorkerClient()
-        else:
-            self.engine = self._ENGINES.get(TTS_BACKEND, MossSynthesizer)()
+        self.engine = self._ENGINES.get(TTS_BACKEND, PhononSynthesizer)()
         self._lock = threading.Lock()
 
     def load(self) -> None:
@@ -1639,7 +1373,7 @@ class Pipeline:
         if dropped_turns:
             logger.warning(
                 "Speech output was %.1f s behind; skipped %d whole turn(s) (%.1f s): %s. "
-                "Lower MOSS_VQ_DEPTH or shorten MAX_UTTERANCE_SECONDS if this repeats.",
+                "Synthesis is slower than real time; shorten MAX_UTTERANCE_SECONDS if this repeats.",
                 self._playout_backlog, len(dropped_turns), dropped_seconds, ", ".join(dropped_turns),
             )
             self._playout_backlog -= dropped_seconds
@@ -1840,7 +1574,7 @@ def run_smoke_test(asr: AsrEngine, translator: Translator, speech: SpeechSynthes
         "translation_backend": TRANSLATION_BACKEND,
         "translation_4bit": translator.quantized,
         "translation_dtype": str(getattr(translator, "dtype", None)),
-        "tts_model": MOSS_MODEL if TTS_BACKEND == "moss" else XTTS_MODEL_NAME,
+        "tts_model": PHONON_MODEL if TTS_BACKEND == "phonon" else XTTS_MODEL_NAME,
         "source_text": source,
         "german_text": translated,
         "asr_tested_on_supplied_audio": bool(audio_path),
@@ -1855,9 +1589,10 @@ def run_smoke_test(asr: AsrEngine, translator: Translator, speech: SpeechSynthes
         "timing_scope": "Sequential offline test after warm-up; NOT live end-to-end latency.",
     }
     if torch.cuda.is_available():
+        used = {pick_device_dtype(device)[1] for device in (ASR_DEVICE, TRANSLATION_DEVICE, TTS_DEVICE)}
         metrics["gpu_peak_allocated_gib"] = {
-            f"cuda:{index}": torch.cuda.max_memory_allocated(index) / 2**30
-            for index in range(torch.cuda.device_count())
+            device: torch.cuda.max_memory_allocated(int(device.split(":")[1])) / 2**30
+            for device in sorted(used) if device != "cpu"
         }
     (destination / "metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
@@ -1874,8 +1609,7 @@ def prepare_models() -> tuple[AsrEngine, Translator, SpeechSynthesizer]:
     dtype, device = pick_device_dtype(ASR_DEVICE)
     default_translation_dtype, translation_device = pick_device_dtype(TRANSLATION_DEVICE)
     _, tts_device = pick_device_dtype(TTS_DEVICE)
-    _check_moss_memory(dtype, device)
-    logger.info("Placement: ASR=%s | translation=%s | TTS/codec=%s",
+    logger.info("Placement: ASR=%s | translation=%s | TTS=%s",
                 device, translation_device, tts_device)
     if TRANSLATION_BACKEND == "translategemma":
         logger.info(
@@ -1893,8 +1627,8 @@ def prepare_models() -> tuple[AsrEngine, Translator, SpeechSynthesizer]:
 
     load_silero_vad()  # Cache the VAD weights before the first speaker thread starts.
 
-    # Reserve TTS and codec memory before the translator decides whether full
-    # precision fits. Otherwise TTS is the last load and has no OOM fallback.
+    # Load the TTS before the translator: if it uses the GPU (XTTS), the
+    # translator's 4-bit OOM fallback then accounts for it.
     speech = SpeechSynthesizer()
     logger.info("Preloading %s so the first spoken turn is fast ...", TTS_BACKEND)
     speech.load()
@@ -2038,11 +1772,9 @@ async def main(smoke_dir: str | None = None, test_audio: str | None = None) -> N
             logger.info("GPU %d: %s (%.1f GiB)", index, props.name, props.total_memory / 2**30)
     logger.info("ASR model: %s", COHERE_MODEL_NAME)
     logger.info("Translation model: %s (%s)", TRANSLATION_MODEL, "4-bit" if TRANSLATION_4BIT else "fp16/bf16")
-    if TTS_BACKEND == "moss":
-        logger.info(
-            "TTS backend: moss (%s, RVQ depth %d, voice: %s)",
-            MOSS_MODEL, MOSS_VQ_DEPTH, MOSS_REF_WAV or "built-in",
-        )
+    if TTS_BACKEND == "phonon":
+        logger.info("TTS backend: phonon (%s, voice: %s, CPU; CC BY-NC 4.0 for 40m models)",
+                    PHONON_MODEL, PHONON_VOICE or "model default")
     else:
         logger.info("TTS backend: xtts")
     logger.info(
@@ -2078,11 +1810,7 @@ if __name__ == "__main__":
                         help="Run offline model checks, save German audio and metrics, then exit.")
     parser.add_argument("--test-audio", metavar="PATH",
                         help="Optional short Arabic WAV/FLAC for the offline ASR check.")
-    parser.add_argument("--tts-worker", action="store_true",
-                        help="Internal: serve TTS requests over stdin/stdout (see TTS_WORKER_PYTHONPATH).")
     args = parser.parse_args()
-    if args.tts_worker:
-        sys.exit(run_tts_worker())
     if args.test_audio and args.smoke_test is None:
         parser.error("--test-audio requires --smoke-test OUTPUT_DIR")
     try:

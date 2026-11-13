@@ -84,24 +84,6 @@ def test_notebook_cells_compile():
     compile(notebook_source(4).split("\n", 1)[1], "embedded-bot", "exec")
 
 
-@pytest.mark.parametrize("gib, allowed", [(15, False), (24, True), (40, True)])
-def test_default_moss_weight_floor(bot, monkeypatch, gib, allowed):
-    monkeypatch.setattr(bot, "pick_device_dtype", lambda requested="auto": (bot.torch.float16, "cuda:0"))
-    monkeypatch.setattr(bot, "TTS_BACKEND", "moss")
-    monkeypatch.setattr(bot, "MOSS_MODEL", "OpenMOSS-Team/MOSS-TTS-Local-Transformer")
-    monkeypatch.setattr(bot, "MOSS_DTYPE", "auto")
-    monkeypatch.setattr(bot, "COHERE_MODEL_NAME", "CohereLabs/cohere-transcribe-arabic-07-2026")
-    monkeypatch.setattr(bot, "COHERE_4BIT", False)
-    monkeypatch.setattr(bot, "TRANSLATION_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
-    monkeypatch.setattr(bot.torch.cuda, "get_device_properties",
-                        lambda index: SimpleNamespace(total_memory=gib * 2**30))
-    if allowed:
-        bot._check_moss_memory(bot.torch.float16, "cuda:0")
-    else:
-        with pytest.raises(RuntimeError, match="cannot fit a T4"):
-            bot._check_moss_memory(bot.torch.float16, "cuda:0")
-
-
 def test_missing_optional_secrets_preserve_required_values(tmp_path, monkeypatch):
     import types
 
@@ -133,7 +115,7 @@ def test_missing_optional_secrets_preserve_required_values(tmp_path, monkeypatch
     namespace = {
         "importlib": importlib,
         "Path": lambda _: tmp_path, "TARGET": tmp_path / ".env",
-        "REQUIRED": tuple(secrets), "OPTIONAL": ("MOSS_DTYPE", "TTS_BACKEND"),
+        "REQUIRED": tuple(secrets), "OPTIONAL": ("PHONON_VOICE", "TTS_BACKEND"),
     }
     exec(compile(ast.Module(body=statements, type_ignores=[]), "secrets-cell", "exec"), namespace)
     assert namespace["find_existing"]() == secrets
@@ -180,7 +162,7 @@ def test_launch_failure_is_logged_and_raised(tmp_path):
     assert captured["env"]["HF_TOKEN"] == "selected-test-token"
 
 
-@pytest.mark.parametrize("backend", ["moss", "xtts"])
+@pytest.mark.parametrize("backend", ["phonon", "xtts"])
 def test_installation_selects_only_needed_backend_and_matches_torch(tmp_path, backend):
     commands = []
 
@@ -204,7 +186,9 @@ def test_installation_selects_only_needed_backend_and_matches_torch(tmp_path, ba
     assert not any("git+" in package for package in packages)
     assert ("coqui-tts>=0.27" in packages) == (backend == "xtts")
     assert ("from TTS.api import TTS" in commands[2][-1]) == (backend == "xtts")
-    assert "PreTrainedAudioTokenizerBase" in commands[2][-1]
+    assert ("ptts" in packages) == (backend == "phonon")
+    assert ("import ptts" in commands[2][-1]) == (backend == "phonon")
+    assert "CohereAsrForConditionalGeneration" in commands[2][-1]
 
 
 def test_dotenv_serialization_roundtrip():
