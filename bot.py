@@ -59,9 +59,9 @@ TRANSLATION_SYSTEM_PROMPT = (
     "You are a professional simultaneous interpreter rendering a Friday sermon "
     "(Jumu'ah khutba) from {src} to {tgt}. The input arrives in short spoken "
     "fragments and may end mid-sentence: render each one faithfully, keep the "
-    "solemn sermon register, keep proper names and Qur'anic phrases in their "
-    "standard transliteration, and stay consistent with the earlier turns "
-    "shown above. Return only the translation, with no explanation."
+    "solemn sermon register, keep proper names and translate Qur'anic phrases, "
+    "and stay consistent with the earlier turns shown above. "
+    "Return only the translation, with no explanation. "
 ).format(src=TRANSLATION_SOURCE_LANG, tgt=TRANSLATION_TARGET_LANG)
 AUDIO_SAMPLE_RATE = 24_000
 AUDIO_FRAME_SAMPLES = AUDIO_SAMPLE_RATE // 50
@@ -100,12 +100,15 @@ def _env_int(name: str, default: int) -> int:
 
 
 # Optional spoken output for the translation; TTS_BACKEND picks the engine:
-#   "f5"   (default) F5-TTS - a German target language speaks the German
-#           fine-tune aihpi/F5-TTS-German, other target languages speak the
-#           standard F5-TTS base model (e.g. English).
-#   "xtts" XTTS-v2 (previous engine).
+#   "f5"      (default) F5-TTS - a German target language speaks the German
+#             fine-tune aihpi/F5-TTS-German, other target languages speak the
+#             standard F5-TTS base model (e.g. English).
+#   "xtts"    XTTS-v2 (previous engine).
+#   "phonon"  Gradium Phonon model for German (gradium/phonon-40m-de); the
+#             speaker is a fixed voice from gradium/phonon-voices (PHONON_VOICE,
+#             default "henrik"), not a cloned reference.
 TTS_BACKEND = os.getenv("TTS_BACKEND", "f5").strip().lower()
-if TTS_BACKEND not in ("f5", "xtts"):
+if TTS_BACKEND not in ("f5", "xtts", "phonon"):
     logger.warning("Invalid TTS_BACKEND=%r; using 'f5' instead", TTS_BACKEND)
     TTS_BACKEND = "f5"
 
@@ -123,10 +126,10 @@ F5_USE_EMA = os.getenv("F5_USE_EMA", "1").strip().lower() in ("1", "true", "yes"
 # ODE inference steps (lower is much faster; 8 is a good speed/quality balance,
 # 32 is the F5-TTS default and the slowest).
 F5_NFE_STEPS = _env_int("F5_NFE_STEPS", 8)
-# Max tokens the ASR / translator may generate per pass. A 12 s utterance
-# transcribes to well under 100 tokens, so a tight cap guards against runaway
-# generation while keeping normal turns unaffected.
-MAX_GEN_TOKENS = _env_int("MAX_GEN_TOKENS", 256)
+# Max tokens the ASR / translator may generate per pass. A 20 s utterance
+# transcribes to well under a few hundred tokens, so the cap guards against
+# runaway generation while keeping normal turns unaffected.
+MAX_GEN_TOKENS = _env_int("MAX_GEN_TOKENS", 512)
 # How many previous (source, translation) pairs to send as chat context so the
 # translator stays consistent across turns (0 disables the context).
 TRANSLATION_CONTEXT_TURNS = _env_int("TRANSLATION_CONTEXT_TURNS", 6)
@@ -134,21 +137,31 @@ TRANSLATION_CONTEXT_TURNS = _env_int("TRANSLATION_CONTEXT_TURNS", 6)
 # XTTS-v2 (only used when TTS_BACKEND=xtts).
 XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
+# Gradium Phonon model (only used when TTS_BACKEND=phonon).
+PHONON_MODEL_NAME = os.getenv("PHONON_MODEL_NAME", "gradium/phonon-40m-de").strip() or "gradium/phonon-40m-de"
+# Voice from gradium/phonon-voices by name (case-insensitive), raw 16-char voice
+# ID, or "default" for the checkpoint's built-in voice.
+PHONON_VOICE = os.getenv("PHONON_VOICE", "henrik").strip() or "henrik"
+PHONON_VOICE_IDS = {
+    "henrik": "yyS1KYWs6mXoEw7D",
+}
+# Temperature for phonon inference (lower is more deterministic).
+PHONON_TEMPERATURE = float(os.getenv("PHONON_TEMPERATURE", "1.0").strip() or "1.0")
 
 SAMPLE_RATE = 16_000
 VAD_CHUNK = 512  # Silero VAD requires exactly 32 ms windows at 16 kHz
 CHUNK_SECONDS = VAD_CHUNK / SAMPLE_RATE
 SPEECH_START_PROB = 0.5
 SPEECH_KEEP_PROB = 0.35
-# Trailing silence that ends an utterance (env END_SILENCE_SECONDS, default 0.4 s).
-# Lower responds faster; too low can split a mid-sentence pause into two turns.
-END_SILENCE_SECONDS = _env_seconds("END_SILENCE_SECONDS", 0.4)
+# Trailing silence that ends an utterance (env END_SILENCE_SECONDS, default 1.0 s).
+# Lower responds faster; 0.4 s chops up natural sermon pauses into short segments.
+END_SILENCE_SECONDS = _env_seconds("END_SILENCE_SECONDS", 1.0)
 END_SILENCE_CHUNKS = round(END_SILENCE_SECONDS / CHUNK_SECONDS)
 PRE_ROLL_CHUNKS = round(0.25 / CHUNK_SECONDS)
 TAIL_CHUNKS = round(0.15 / CHUNK_SECONDS)
 MIN_SPEECH_CHUNKS = round(0.25 / CHUNK_SECONDS)
 # Env MAX_UTTERANCE_SECONDS: longest utterance (seconds) sent to the ASR.
-MAX_UTTERANCE_SECONDS = _env_seconds("MAX_UTTERANCE_SECONDS", 12.0)
+MAX_UTTERANCE_SECONDS = _env_seconds("MAX_UTTERANCE_SECONDS", 20.0)
 MAX_UTTERANCE_CHUNKS = round(MAX_UTTERANCE_SECONDS / CHUNK_SECONDS)
 SPLIT_SEARCH_CHUNKS = round(2.0 / CHUNK_SECONDS)
 INTERIM_STEP_CHUNKS = round(0.4 / CHUNK_SECONDS)
@@ -425,12 +438,17 @@ class SpeechSynthesizer:
 
     "f5" (default): F5-TTS - a German target language via the German
     fine-tune aihpi/F5-TTS-German, other target languages via the standard
-    F5-TTS base model. "xtts": XTTS-v2.
-    The model loads lazily on the first spoken translation request.
+    F5-TTS base model. "xtts": XTTS-v2. "phonon": Gradium Phonon model for
+    German. The model loads lazily on the first spoken translation request.
     """
 
     def __init__(self) -> None:
-        self.engine = XttsSynthesizer() if TTS_BACKEND == "xtts" else F5Synthesizer()
+        if TTS_BACKEND == "xtts":
+            self.engine = XttsSynthesizer()
+        elif TTS_BACKEND == "phonon":
+            self.engine = PhononSynthesizer()
+        else:
+            self.engine = F5Synthesizer()
 
     def synthesize(self, text: str) -> np.ndarray:
         return self.engine.synthesize(text)
@@ -463,6 +481,137 @@ class XttsSynthesizer:
         elif self.speaker:
             options["speaker"] = self.speaker
         return np.asarray(self.model.tts(**options), dtype=np.float32).reshape(-1)
+
+
+# Shared Phonon model cache: built once (e.g. by the startup preload) and reused
+# by every PhononSynthesizer instance so the heavy load happens only once.
+_PHONON_CACHE = None  # (model, processor, voice_latents)
+
+
+def _phonon_voice_id(name: str) -> str:
+    """A German voice name as its gradium/phonon-voices ID (case-insensitive).
+
+    Unknown names are assumed to already be a raw 16-char voice ID and passed
+    through unchanged.
+    """
+    lowered = name.lower()
+    for voice_name, voice_id in PHONON_VOICE_IDS.items():
+        if voice_name.lower() == lowered:
+            return voice_id
+    return name
+
+
+def _phonon_decode_audio(decoded) -> np.ndarray:
+    """Flattens PocketTTSProcessor.decode() output to float32 mono samples."""
+    audio = decoded["audio"] if isinstance(decoded, dict) else decoded
+    if isinstance(audio, (list, tuple)):
+        audio = torch.cat(audio) if audio else torch.zeros(0)
+    if torch.is_tensor(audio):
+        audio = audio.float().cpu().numpy()
+    return np.asarray(audio, dtype=np.float32).reshape(-1)
+
+
+class PhononSynthesizer:
+    """Gradium Phonon German TTS (engine when TTS_BACKEND=phonon).
+
+    Not a voice-cloning model: the voice is a precomputed 512-d speaker
+    embedding from the gradium/phonon-voices catalog (default: Henrik, a
+    German male voice; PHONON_VOICE picks another German voice name, a raw
+    voice ID, or "default" for the checkpoint's own voice). Needs a
+    transformers build with GradiumPhononTTSForConditionalGeneration (git
+    main) and a valid HF_TOKEN (the model repo is gated). Emits 24 kHz mono
+    speech.
+    """
+
+    def __init__(self) -> None:
+        self._state = None  # (model, processor, voice_latents)
+
+    def _load(self):
+        global _PHONON_CACHE
+        if self._state is not None:
+            return self._state
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+        from transformers import AutoProcessor, GradiumPhononTTSForConditionalGeneration
+
+        if _PHONON_CACHE is not None:
+            self._state = _PHONON_CACHE
+            return self._state
+
+        use_cuda = torch.cuda.is_available()
+        dtype = torch.bfloat16 if use_cuda else torch.float32
+        logger.info("Loading Phonon model %s ...", PHONON_MODEL_NAME)
+        load_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
+        try:
+            processor = AutoProcessor.from_pretrained(PHONON_MODEL_NAME, **load_kwargs)
+            model = GradiumPhononTTSForConditionalGeneration.from_pretrained(
+                PHONON_MODEL_NAME,
+                torch_dtype=dtype,
+                device_map="cuda:0" if use_cuda else "cpu",
+                **load_kwargs,
+            )
+            model.eval()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not load Phonon model {PHONON_MODEL_NAME}: {exc}. "
+                "It needs a transformers build with "
+                "GradiumPhononTTSForConditionalGeneration (pip install -U "
+                "'git+https://github.com/huggingface/transformers') and a valid "
+                "HF_TOKEN (the repo requires accepting its license on Hugging Face)."
+            ) from exc
+
+        if PHONON_VOICE == "default":
+            logger.info("Phonon voice: built-in default of %s", PHONON_MODEL_NAME)
+            voice_path = hf_hub_download(PHONON_MODEL_NAME, "default-voice.safetensors", **load_kwargs)
+        else:
+            voice_id = _phonon_voice_id(PHONON_VOICE)
+            logger.info("Phonon voice: %s (%s)", PHONON_VOICE, voice_id)
+            voice_path = hf_hub_download(
+                "gradium/phonon-voices", f"voices/{voice_id}.safetensors", **load_kwargs
+            )
+        # Speaker embedding latents of shape (num_frames, 512).
+        voice = load_file(voice_path)["speaker_wavs"][0].T.float()
+
+        self._state = _PHONON_CACHE = (model, processor, voice)
+        return self._state
+
+    def synthesize(self, text: str) -> np.ndarray:
+        model, processor, voice = self._load()
+
+        start = time.perf_counter()
+        try:
+            parts = []
+            for chunk in processor.split_text(text):
+                # An empty "audio" content item marks where the voice goes.
+                conversation = [
+                    {
+                        "role": "user",
+                        "content": [{"type": "audio"}, {"type": "text", "text": chunk}],
+                    }
+                ]
+                inputs = processor.apply_chat_template(
+                    conversation,
+                    tokenize=True,
+                    return_dict=True,
+                    add_generation_prompt=True,
+                    processor_kwargs={"audio_prompt_latents": [voice]},
+                ).to(model.device)
+                with torch.inference_mode():
+                    outputs = model.generate(**inputs, temperature=PHONON_TEMPERATURE)
+                samples = _phonon_decode_audio(
+                    processor.decode(outputs.audio_latents, outputs.audio_latents_mask)
+                )
+                if samples.size:
+                    parts.append(samples)
+            audio = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+            ms = (time.perf_counter() - start) * 1000
+            logger.info("TTS %.0f ms (%.1f s audio)", ms, audio.size / AUDIO_SAMPLE_RATE)
+            return audio
+        except Exception:
+            logger.exception("Phonon synthesis failed")
+            ms = (time.perf_counter() - start) * 1000
+            logger.info("TTS %.0f ms (failed)", ms)
+            return np.zeros(0, dtype=np.float32)
 
 
 def _resolve_f5_ref_wav() -> str:
@@ -587,6 +736,14 @@ def prepare_models():
             speech.synthesize("warm-up")  # Warm F5's first inference once
         except Exception:
             logger.exception("F5-TTS warm-up failed (non-fatal)")
+    elif TTS_BACKEND == "phonon":
+        logger.info("Preloading Phonon model so the first spoken turn is fast ...")
+        speech = PhononSynthesizer()
+        try:
+            speech._load()
+            speech.synthesize("warm-up")  # Warm Phonon's first inference once
+        except Exception:
+            logger.exception("Phonon warm-up failed (non-fatal)")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return models, translator, tokenizer
