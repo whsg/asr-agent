@@ -17,6 +17,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Deterministic configuration so a developer's local .env cannot shift results.
 TEST_ENV = {
+    "ASR_DEVICE": "auto",
+    "TRANSLATION_DEVICE": "auto",
+    "TTS_DEVICE": "auto",
+    "TRANSLATION_BACKEND": "qwen",
     "STREAM_TTS": "1",
     "INTERIM_CAPTIONS": "0",
     "TTS_FIRST_CHUNK_CHARS": "40",
@@ -68,6 +72,7 @@ def _install_torch_stub() -> None:
 
     cuda = types.SimpleNamespace(
         is_available=lambda: False,
+        device_count=lambda: 0,
         get_device_capability=lambda _index=0: (7, 5),
         get_device_properties=lambda _index=0: types.SimpleNamespace(name="stub", total_memory=0),
         empty_cache=lambda: None,

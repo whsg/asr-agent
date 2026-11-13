@@ -67,12 +67,12 @@
       <h1>asr-agent — Arabic → German live transcription</h1>
       <p>
         A browser mic client streams speech over <strong>LiveKit</strong> to a GPU bot on
-        <strong>Google Colab</strong>. The bot cuts the audio into sentences with a shared
-        Silero-VAD segmenter and transcribes every utterance with
-        <strong>Cohere Transcribe Arabic</strong>. The Arabic text is then translated to German by
-        <strong>TranslateGemma</strong> (12B by default, or a smaller/faster 4B via
-        <code>GEMMA_TRANSLATION_MODEL</code>), and the transcripts (plus optional German speech) are
-        sent back to the browser in near real time.
+        <strong>Google Colab</strong>. The bot cuts the audio into sentences with a a
+        Silero-VAD thread per speaker and transcribes every utterance with
+        <strong>Cohere Transcribe Arabic</strong>. The Arabic text is translated to German by
+        <strong>Qwen3-4B-Instruct</strong> in fp16 and spoken by <strong>MOSS-TTS</strong>
+        (Apache-2.0, built-in German voice). Every stage is an independent worker, so the
+        transcript, the translation and the speech stream back in near real time.
       </p>
 
       <div class="grid">
@@ -85,8 +85,8 @@
           <p>The transport. Carries the audio track to the bot and the per-backend transcript data messages, the translation, and the optional TTS audio back to the browser.</p>
         </div>
         <div class="card">
-          <h3>🤖 Colab (T4 GPU)</h3>
-          <p><code>bot.py</code>: shared Silero VAD + Cohere ASR + 4-bit TranslateGemma + optional F5-TTS spoken output (German fine-tune <code>aihpi/F5-TTS-German</code>); <code>TTS_BACKEND=xtts</code> selects XTTS-v2 instead.</p>
+          <h3>🤖 Colab (A100 recommended for MOSS)</h3>
+          <p><code>bot.py</code>: VAD threads + Cohere ASR + fp16 Qwen3 translator + MOSS-TTS spoken output, run as a streaming pipeline; <code>TTS_BACKEND=xtts</code> selects XTTS-v2 instead.</p>
         </div>
       </div>
 
@@ -103,8 +103,8 @@
           subgraph COL["Colab GPU"]
             SEGC["Silero VAD<br/>shared sentence splitter"]
             ASRC["Cohere Transcribe Arabic<br/>cohere-transcript"]
-            TR["TranslateGemma (4-bit)"]
-            TTS["F5-TTS (default), XTTS-v2 fallback<br/>German speech (opt.)"]
+            TR["Qwen3-4B-Instruct (fp16)<br/>token streaming"]
+            TTS["MOSS-TTS (default), XTTS-v2 fallback<br/>German speech (opt.)"]
             SEGC --> ASRC
             ASRC --> TR
             TR --> TTS
@@ -119,21 +119,25 @@
 
       <h2>What the bot does with each sentence</h2>
       <p>
-        The Silero-VAD segmentation runs once per speaker and feeds Cohere. All GPU work
-        (transcription, translation, TTS) is serialized through one shared lock, and finished
-        utterances are always processed before live interim updates.
+        Every stage is an independent worker with its own queue, so stage N of one utterance
+        overlaps stage N+1 of the previous one. GPU access is admitted by a bounded,
+        priority-aware scheduler, and the real-time playout runs in its own task so it can never
+        stall a GPU stage. A short pause does not end a sentence unless the segment already
+        holds <code>MIN_SENTENCE_SECONDS</code> of speech, so a mid-sentence breath is not
+        mistaken for the end of a sentence.
       </p>
       <div class="mermaid">
         flowchart TD
-          A["Raw 16 kHz audio (one shared VAD per speaker)"] --> B{"Silero VAD<br/>start / end of speech?"}
-          B -->|"gap &gt; 0.55 s"| C["Finished utterance<br/>queued for every enabled backend"]
+          A["Raw 16 kHz audio (VAD thread per speaker)"] --> B{"Silero VAD<br/>end of sentence?"}
+          B -->|"long enough pause"| C["Finished utterance queued"]
           C --> D["Transcribe with Cohere"]
           D --> E["Send final on cohere-transcript"]
-          E --> F["Translate Arabic to German<br/>(TranslateGemma, 4-bit)"]
-          F --> G["Send translation on asr-translation"]
-          G --> H{"German speech<br/>enabled?"}
-          H -->|yes| I["Synthesize &amp; play TTS"]
-          B -->|"still talking &amp; GPU free"| J["Live Cohere interim updates"]
+          E --> F["Translate to German (Qwen3)<br/>tokens streamed out"]
+          F --> G["Send translation on asr-translation<br/>updated while it is generated"]
+          F --> H{"German speech<br/>enabled?"}
+          H -->|yes| I["Synthesize each finished clause"]
+          I --> K["Playout task<br/>real time, own queue"]
+          B -->|"still talking &amp; pipeline idle"| J["Live Cohere interim updates"]
       </div>
 
       <h2>LiveKit message types</h2>
@@ -151,12 +155,13 @@
       <h2>Running it</h2>
       <p>
         You need two things: a <strong>LiveKit Cloud account</strong> (Project &rarr; API keys) and
-        a <strong>Google Colab</strong> account (a free T4 GPU is enough). Then:
+        a <strong>Google Colab</strong> account with a larger GPU for MOSS
+        (A100 40 GB recommended; the default stack cannot fit a T4). Then:
       </p>
       <ol>
         <li>
           <strong>Start the bot in Colab.</strong> In <code>colab_agent.ipynb</code> set the
-          runtime to <em>Runtime &gt; Change runtime type &gt; T4 GPU</em>, then
+          runtime to <em>Runtime &gt; Change runtime type &gt; A100 GPU</em>, then
           <em>Runtime &gt; Run all</em>. The first cell asks you to upload your
           <code>.env</code> file (copy <code>.env.example</code>, fill in the three LiveKit keys
           &mdash; more below). The install cell adds the extra packages automatically.
@@ -166,28 +171,28 @@
         <li>
           <strong>Configure the <code>.env</code></strong> with the LiveKit credentials
           (<code>LIVEKIT_URL</code>, <code>LIVEKIT_API_KEY</code>, <code>LIVEKIT_API_SECRET</code>)
-          and a Hugging Face <code>HF_TOKEN</code> with access to the gated Cohere and TranslateGemma repositories:
+          and a Hugging Face <code>HF_TOKEN</code> with access to the gated Cohere repository:
           <ul>
-            <li><strong>Gated models:</strong> accept the terms for Cohere Transcribe Arabic and TranslateGemma on Hugging Face, then add an authorized <code>HF_TOKEN</code> to the <code>.env</code>.</li>
-            <li><code>COHERE_4BIT=1</code> &mdash; optional; 4-bit-quantizes the Cohere ASR model to save VRAM.</li>
-            <li><code>GEMMA_TRANSLATION_MODEL</code> &mdash; <code>google/translategemma-12b-it</code> (default, best quality) or <code>google/translategemma-4b-it</code> for a smaller/faster model that uses less VRAM.</li>
-            <li><strong>Spoken German output needs a reference voice</strong> &mdash; the default F5-TTS
-            engine is a voice-cloning model, so set <code>F5_REF_WAV</code> (a ~5&ndash;10 s wav of the
-            voice you want; a URL or a Colab file path) and <code>F5_REF_TEXT</code> (the exact text
-            spoken in that clip) in the <code>.env</code> before enabling "German speech output" in the
-            web app. Set <code>TTS_BACKEND=xtts</code> to use XTTS-v2 instead (no reference clip
-            needed &mdash; it picks a pre-made voice via <code>XTTS_SPEAKER</code> / <code>XTTS_SPEAKER_WAV</code>).</li>
-            <li>Other overrides: <code>LIVEKIT_ROOM</code>, <code>COHERE_MODEL</code>, <code>GEMMA_TRANSLATION_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>F5_GERMAN_REPO</code> / <code>F5_GERMAN_CKPT</code>, <code>MAX_UTTERANCE_SECONDS</code> (default 12 s, longer utterances are split).</li>
+            <li><strong>Gated model:</strong> accept the terms for Cohere Transcribe Arabic on Hugging Face, then add an authorized <code>HF_TOKEN</code> to the <code>.env</code>. Qwen3 and MOSS-TTS are open and need no token.</li>
+            <li><code>COHERE_4BIT=1</code> &mdash; optional; 4-bit-quantizes the Cohere ASR model to free VRAM for the fp16 translator.</li>
+            <li><code>TRANSLATION_MODEL</code> &mdash; <code>Qwen/Qwen3-4B-Instruct-2507</code> by default; an 8B variant translates better but decodes slower.</li>
+            <li><strong>Spoken German output needs no configuration</strong> &mdash; MOSS-TTS has a
+            built-in voice, so just enable "German speech output" in the web app. Set
+            <code>MOSS_REF_WAV</code> only to clone a specific voice, or
+            <code>TTS_BACKEND=xtts</code> for XTTS-v2
+            (<code>XTTS_SPEAKER</code> / <code>XTTS_SPEAKER_WAV</code>).</li>
+            <li>Other overrides: <code>LIVEKIT_ROOM</code>, <code>COHERE_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>MOSS_VQ_DEPTH</code> (TTS speed/quality dial), <code>MIN_SENTENCE_SECONDS</code>, <code>MAX_UTTERANCE_SECONDS</code> (default 12 s, longer utterances are split).</li>
           </ul>
         </li>
         <li>
-          <strong>VRAM budget on a T4 (15.75 GB):</strong> Cohere ASR plus 4-bit TranslateGemma (12B or 4B)
-          fits without TTS &mdash; pick the 4B model if you need extra headroom. Enable <code>COHERE_4BIT=1</code> to free
-          more memory. The TTS model is not loaded at startup
-          &mdash; it loads on the first spoken request (triggering a one-time ~2.7 GB checkpoint
-          download), and the German F5-TTS model uses ~4.1 GB on GPU (fp16), so leave that much
-          headroom before turning on the speech output; <code>TTS_BACKEND=xtts</code> uses the much
-          smaller XTTS-v2 instead.
+          <strong>VRAM budget:</strong> The current MOSS Local checkpoint has 3.06B parameters,
+          plus a separate 1.77B float32 audio codec. With ASR and the full-precision
+          translator, weights alone need about 23.7 GiB, before inference memory.
+          Use a larger GPU (32 GiB+ recommended; e.g. A100 40 GB).
+          Startup checks known weight requirements before downloading models,
+          loads ASR, then TTS/codec, then the translator, and requires successful warm-ups.
+          The last cell saves output to <code>/content/bot.log</code>; installation
+          output is in <code>/content/install.log</code>.
         </li>
         <li>
           <strong>Start the web app on your PC.</strong> Install
@@ -206,7 +211,7 @@
       <p>
         <strong>Troubleshooting:</strong> no <code>READY</code> line after ~5 minutes &rarr; check the
         Colab logs (most often a wrong token or a used-up free GPU quota); the web app shows
-        &ldquo;ASR bot missing&rdquo; &rarr; the bot is not in the room yet; Cohere or TranslateGemma fails to load
+        &ldquo;ASR bot missing&rdquo; &rarr; the bot is not in the room yet; a model fails to load
         &rarr; accept both repository terms on huggingface.co and set <code>HF_TOKEN</code>.
       </p>
     </main>

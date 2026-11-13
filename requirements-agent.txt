@@ -1,16 +1,20 @@
 livekit>=1.0
 livekit-api>=1.0
-f5-tts
-transformers>=5.4.0
+transformers>=5.4.0,<6
 bitsandbytes>=0.45
 accelerate
-coqui-tts>=0.27
 numpy>=1.26
 python-dotenv>=1.0
 silero-vad>=5.1
 torch
 huggingface_hub
 soundfile
+torchaudio
 librosa
 sentencepiece
 protobuf
+einops
+tiktoken
+# TTS_BACKEND=xtts only: pip install 'coqui-tts>=0.27'
+# MOSS loads model and codec code via transformers trust_remote_code.
+# Keep torch and torchaudio on matching releases (Colab pins its installed torch).
