@@ -10,7 +10,8 @@ Finished utterances are translated to German with Qwen3:
   topic "asr-translation": {"type": "translation", "id": str, "text": str}
 
 On request the translation is also spoken: TTS_BACKEND picks the engine
-("f5" = F5-TTS, default, or "xtts" = XTTS-v2).
+("phonon" = Gradium Phonon with a fixed voice from gradium/phonon-voices,
+default, "xtts" = XTTS-v2).
 
 Runs on a GPU (e.g. Colab).
 """
@@ -25,7 +26,6 @@ import os
 import secrets
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -57,11 +57,22 @@ TRANSLATION_TARGET_LANG = os.getenv("TRANSLATION_TARGET_LANG", "de").strip() or 
 # explanation" prompt.
 TRANSLATION_SYSTEM_PROMPT = (
     "You are a professional simultaneous interpreter rendering a Friday sermon "
-    "(Jumu'ah khutba) from {src} to {tgt}. The input arrives in short spoken "
-    "fragments and may end mid-sentence: render each one faithfully, keep the "
-    "solemn sermon register, keep proper names and translate Qur'anic phrases, "
-    "and stay consistent with the earlier turns shown above. "
-    "Return only the translation, with no explanation. "
+    "(Jumu'ah khutba) from {src} to {tgt}, streaming. You see the earlier "
+    "turns, then a PENDING part (source text you held back before because its "
+    "meaning was incomplete) and the current NEW INPUT. Add the new input to "
+    "the pending text and judge how much of it now forms coherent, complete "
+    "sentences. Never translate word-for-word: produce one compact, fluent "
+    "rendering; merge the fragments into clean prose, drop filler words, "
+    "greetings and repetitions, and silently fix obvious speech-recognition "
+    "errors. Keep the solemn sermon register, keep proper names, translate "
+    "Qur'anic phrases, and stay consistent with the earlier turns. Reply in "
+    "exactly this format, with no other text:\n"
+    "<translate>\nThe {tgt} text to release now, complete sentences only, or "
+    "leave empty if nothing is coherent yet.\n</translate>\n<pending>\n"
+    "{src} source text still awaiting its continuation, or leave empty.\n"
+    "</pending>\n"
+    "The pending part must only contain text from what you were given; when "
+    "in doubt, release it in <translate>. "
 ).format(src=TRANSLATION_SOURCE_LANG, tgt=TRANSLATION_TARGET_LANG)
 AUDIO_SAMPLE_RATE = 24_000
 AUDIO_FRAME_SAMPLES = AUDIO_SAMPLE_RATE // 50
@@ -100,44 +111,27 @@ def _env_int(name: str, default: int) -> int:
 
 
 # Optional spoken output for the translation; TTS_BACKEND picks the engine:
-#   "f5"      (default) F5-TTS - a German target language speaks the German
-#             fine-tune aihpi/F5-TTS-German, other target languages speak the
-#             standard F5-TTS base model (e.g. English).
+#   "phonon"  (default) Gradium Phonon model for German (gradium/phonon-40m-de);
+#             the speaker is a fixed voice from gradium/phonon-voices
+#             (PHONON_VOICE, default "henrik"), not a cloned reference.
 #   "xtts"    XTTS-v2 (previous engine).
-#   "phonon"  Gradium Phonon model for German (gradium/phonon-40m-de); the
-#             speaker is a fixed voice from gradium/phonon-voices (PHONON_VOICE,
-#             default "henrik"), not a cloned reference.
-TTS_BACKEND = os.getenv("TTS_BACKEND", "f5").strip().lower()
-if TTS_BACKEND not in ("f5", "xtts", "phonon"):
-    logger.warning("Invalid TTS_BACKEND=%r; using 'f5' instead", TTS_BACKEND)
-    TTS_BACKEND = "f5"
+TTS_BACKEND = os.getenv("TTS_BACKEND", "phonon").strip().lower()
+if TTS_BACKEND not in ("xtts", "phonon"):
+    logger.warning("Invalid TTS_BACKEND=%r; using 'phonon' instead", TTS_BACKEND)
+    TTS_BACKEND = "phonon"
 
-# F5-TTS settings.
-F5_GERMAN_REPO = os.getenv("F5_GERMAN_REPO", "aihpi/F5-TTS-German").strip() or "aihpi/F5-TTS-German"
-F5_GERMAN_CKPT = os.getenv("F5_GERMAN_CKPT", "F5TTS_Base/model_420000.safetensors").strip() or "F5TTS_Base/model_420000.safetensors"
-F5_BASE_MODEL = os.getenv("F5_BASE_MODEL", "F5TTS_v1_Base").strip() or "F5TTS_v1_Base"
-# F5-TTS is a voice-cloning model: it needs a short reference clip (~5-10 s)
-# of the desired voice and the spoken text of it (for German, a German clip).
-# F5_REF_WAV: file in the Colab runtime (e.g. /content/reference.wav) or http(s) URL.
-F5_REF_WAV = os.getenv("F5_REF_WAV", "").strip()
-F5_REF_TEXT = os.getenv("F5_REF_TEXT", "").strip()
-# Load EMA weights (recommended for the fully fine-tuned checkpoints).
-F5_USE_EMA = os.getenv("F5_USE_EMA", "1").strip().lower() in ("1", "true", "yes", "on")
-# ODE inference steps (lower is much faster; 8 is a good speed/quality balance,
-# 32 is the F5-TTS default and the slowest).
-F5_NFE_STEPS = _env_int("F5_NFE_STEPS", 8)
 # Max tokens the ASR / translator may generate per pass. A 20 s utterance
 # transcribes to well under a few hundred tokens, so the cap guards against
 # runaway generation while keeping normal turns unaffected.
 MAX_GEN_TOKENS = _env_int("MAX_GEN_TOKENS", 512)
 # How many previous (source, translation) pairs to send as chat context so the
 # translator stays consistent across turns (0 disables the context).
-TRANSLATION_CONTEXT_TURNS = _env_int("TRANSLATION_CONTEXT_TURNS", 6)
+TRANSLATION_CONTEXT_TURNS = _env_int("TRANSLATION_CONTEXT_TURNS", 5)
 
 # XTTS-v2 (only used when TTS_BACKEND=xtts).
 XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
-# Gradium Phonon model (only used when TTS_BACKEND=phonon).
+# Gradium Phonon model (TTS_BACKEND=phonon, the default).
 PHONON_MODEL_NAME = os.getenv("PHONON_MODEL_NAME", "gradium/phonon-40m-de").strip() or "gradium/phonon-40m-de"
 # Voice from gradium/phonon-voices by name (case-insensitive), raw 16-char voice
 # ID, or "default" for the checkpoint's built-in voice.
@@ -384,7 +378,7 @@ def load_qwen3(dtype, device_map):
     return model, tokenizer
 
 
-def _translate_text_qwen3(model, tokenizer, text: str, context: list[tuple[str, str]] = ()) -> str:
+def _build_translator_messages(text: str, context: list[tuple[str, str]], pending: str = "") -> list[dict]:
     if TRANSLATION_SYSTEM_PROMPT:
         messages = [{"role": "system", "content": TRANSLATION_SYSTEM_PROMPT}]
         messages += [
@@ -396,16 +390,54 @@ def _translate_text_qwen3(model, tokenizer, text: str, context: list[tuple[str, 
         ]
     else:
         messages = []
+    if pending:
+        content = f"PENDING (held over, still missing its continuation): {pending}\nNEW INPUT: {text}"
+    else:
+        content = text
     messages.append(
         {
             "role": "user",
             "content": (
                 f"Translate the following text from {TRANSLATION_SOURCE_LANG} to "
                 f"{TRANSLATION_TARGET_LANG}. Return only the translation, with no "
-                f"explanation.\n\n{text}"
+                f"explanation.\n\n{content}"
             ),
         }
     )
+    return messages
+
+
+def _parse_translation_reply(raw: str, original: str) -> tuple[str, str]:
+    """Splits the model's <translate>/<pending> reply; any malformation falls back
+    to the whole (tag-stripped) reply as the translation so no text is lost."""
+    import re
+
+    def _between(open_tag: str, close_tag: str) -> str | None:
+        start = raw.find(open_tag)
+        end = raw.find(close_tag)
+        if start != -1 and end != -1 and end > start:
+            return raw[start + len(open_tag) : end].strip()
+        return None
+
+    released = _between("<translate>", "</translate>")
+    pending = _between("<pending>", "</pending>")
+    if released is None:
+        # No well-formed <translate> part: treat the whole reply as the
+        # translation and drop the pending bookkeeping.
+        released = re.sub(r"</?(?:translate|pending)>", "", raw).strip()
+        released = re.sub(r"^\s*translate\s*:\s*", "", released, flags=re.IGNORECASE)
+        pending = ""
+    if not released:
+        # Nothing coherent was released: fall back to the new input itself so
+        # no source text is ever lost to an empty reply.
+        released, pending = original, ""
+    return released, pending
+
+
+def _translate_text_qwen3(
+    model, tokenizer, text: str, context: list[tuple[str, str]] = (), pending: str = ""
+) -> tuple[str, str]:
+    messages = _build_translator_messages(text, context, pending)
     # enable_thinking=False: some Qwen3 instruct models (e.g. Qwen3-8B) think
     # with a reasoning block by default, which is slow and can eat the whole
     # output budget before reaching the translation. We only ever want the
@@ -426,29 +458,30 @@ def _translate_text_qwen3(model, tokenizer, text: str, context: list[tuple[str, 
     ms = (time.perf_counter() - start) * 1000
     generated = output[0, input_len:]
     logger.info("Translate %.0f ms (%d out tokens)", ms, generated.shape[0])
-    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+    return _parse_translation_reply(
+        tokenizer.decode(generated, skip_special_tokens=True).strip(), text
+    )
 
 
-def translate_text(model, tokenizer, text: str, context: list[tuple[str, str]] = ()) -> str:
-    return _translate_text_qwen3(model, tokenizer, text, context)
+def translate_text(
+    model, tokenizer, text: str, context: list[tuple[str, str]] = (), pending: str = ""
+) -> tuple[str, str]:
+    return _translate_text_qwen3(model, tokenizer, text, context, pending)
 
 
 class SpeechSynthesizer:
     """Spoken output for the translation; the engine is picked by TTS_BACKEND.
 
-    "f5" (default): F5-TTS - a German target language via the German
-    fine-tune aihpi/F5-TTS-German, other target languages via the standard
-    F5-TTS base model. "xtts": XTTS-v2. "phonon": Gradium Phonon model for
-    German. The model loads lazily on the first spoken translation request.
+    "phonon" (default): Gradium Phonon model for German with a fixed voice
+    from gradium/phonon-voices. "xtts": XTTS-v2. The model loads lazily on
+    the first spoken translation request.
     """
 
     def __init__(self) -> None:
         if TTS_BACKEND == "xtts":
             self.engine = XttsSynthesizer()
-        elif TTS_BACKEND == "phonon":
-            self.engine = PhononSynthesizer()
         else:
-            self.engine = F5Synthesizer()
+            self.engine = PhononSynthesizer()
 
     def synthesize(self, text: str) -> np.ndarray:
         return self.engine.synthesize(text)
@@ -512,7 +545,7 @@ def _phonon_decode_audio(decoded) -> np.ndarray:
 
 
 class PhononSynthesizer:
-    """Gradium Phonon German TTS (engine when TTS_BACKEND=phonon).
+    """Gradium Phonon German TTS (default engine, TTS_BACKEND=phonon).
 
     Not a voice-cloning model: the voice is a precomputed 512-d speaker
     embedding from the gradium/phonon-voices catalog (default: Henrik, a
@@ -614,104 +647,6 @@ class PhononSynthesizer:
             return np.zeros(0, dtype=np.float32)
 
 
-def _resolve_f5_ref_wav() -> str:
-    """Local path of the F5-TTS reference audio; downloads http(s) URLs once."""
-    if F5_REF_WAV.startswith(("http://", "https://")):
-        dest = Path.home() / ".cache" / "asr-agent" / "f5_ref.wav"
-        if not dest.exists():
-            logger.info("Downloading F5-TTS reference audio to %s ...", dest)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            urllib.request.urlretrieve(F5_REF_WAV, str(dest))
-        return str(dest)
-    path = Path(F5_REF_WAV)
-    if not path.is_file():
-        raise RuntimeError(f"F5 reference file not found: {F5_REF_WAV}")
-    return str(path)
-
-
-# Shared F5-TTS model cache: built once (e.g. by the startup preload) and reused
-# by every F5Synthesizer instance so the heavy load happens only once.
-_F5_TTS_MODEL = None
-
-
-class F5Synthesizer:
-    """F5-TTS voice (default engine).
-
-    The voice is cloned from a reference clip (F5_REF_WAV + F5_REF_TEXT). A
-    German target language uses the German fine-tune aihpi/F5-TTS-German, any
-    other target language the standard F5-TTS base model.
-    """
-
-    def __init__(self) -> None:
-        self.model = None
-        self.ref_wav = ""
-
-    def _load(self):
-        global _F5_TTS_MODEL
-        if self.model is not None:
-            return self.model
-        from f5_tts.api import F5TTS
-        from huggingface_hub import hf_hub_download
-
-        if not F5_REF_WAV:
-            raise RuntimeError(
-                "TTS backend 'f5' is enabled but F5_REF_WAV is not set. F5-TTS is a "
-                "voice-cloning model: set F5_REF_WAV to a short reference clip "
-                "(~5-10 s wav of the desired voice) available in the Colab runtime and "
-                "F5_REF_TEXT to the spoken text of the clip (or set TTS_BACKEND=xtts)."
-            )
-        if not F5_REF_TEXT:
-            raise RuntimeError(
-                "TTS backend 'f5' is enabled but F5_REF_TEXT is not set. The spoken "
-                "text of the reference clip is required (without it F5-TTS would load "
-                "a ~1.6 GB Whisper model just to transcribe the clip)."
-            )
-        self.ref_wav = _resolve_f5_ref_wav()
-
-        if _F5_TTS_MODEL is not None:
-            self.model = _F5_TTS_MODEL
-            return self.model
-
-        if TRANSLATION_TARGET_LANG.strip().lower() == "de":
-            logger.info("Loading F5-TTS: German fine-tune %s (%s) ...", F5_GERMAN_REPO, F5_GERMAN_CKPT)
-            ckpt_file = hf_hub_download(repo_id=F5_GERMAN_REPO, filename=F5_GERMAN_CKPT)
-            vocab_file = hf_hub_download(repo_id=F5_GERMAN_REPO, filename="vocab.txt")
-            model_name = "F5TTS_Base"
-        else:
-            logger.info("Loading F5-TTS: standard base model %s ...", F5_BASE_MODEL)
-            ckpt_file = ""
-            vocab_file = ""
-            model_name = F5_BASE_MODEL
-        self.model = F5TTS(
-            model=model_name,
-            ckpt_file=ckpt_file,
-            vocab_file=vocab_file,
-            use_ema=F5_USE_EMA,
-            device="cuda:0" if torch.cuda.is_available() else "cpu",
-        )
-        _F5_TTS_MODEL = self.model
-        return self.model
-
-    def synthesize(self, text: str) -> np.ndarray:
-        model = self._load()
-        start = time.perf_counter()
-        wav, _sample_rate, _spectrogram = model.infer(
-            ref_file=self.ref_wav,
-            ref_text=F5_REF_TEXT,
-            gen_text=text,
-            show_info=lambda *args: None,
-            progress=None,
-            nfe_step=F5_NFE_STEPS,
-        )
-        ms = (time.perf_counter() - start) * 1000
-        if wav is None:
-            logger.info("TTS %.0f ms (no audio produced)", ms)
-            return np.zeros(0, dtype=np.float32)
-        audio = np.asarray(wav, dtype=np.float32).reshape(-1)
-        logger.info("TTS %.0f ms (%.1f s audio)", ms, audio.size / AUDIO_SAMPLE_RATE)
-        return audio
-
-
 def prepare_models():
     dtype, device_map = pick_dtype()
     rng = np.random.default_rng(0)
@@ -724,19 +659,11 @@ def prepare_models():
     logger.info("Loading Qwen3 %s in 4-bit", TRANSLATION_MODEL)
     translator, tokenizer = load_qwen3(dtype, device_map)
     try:
-        translate_text(translator, tokenizer, "warm-up")  # Warm Qwen3's first inference
+        translate_text(translator, tokenizer, "warm-up")  # Warm Qwen3's first inference (reply discarded)
     except Exception:
         logger.exception("Qwen3 warm-up failed (non-fatal)")
     load_silero_vad()
-    if TTS_BACKEND == "f5" and F5_REF_WAV and F5_REF_TEXT:
-        logger.info("Preloading F5-TTS so the first spoken turn is fast ...")
-        speech = F5Synthesizer()
-        speech._load()
-        try:
-            speech.synthesize("warm-up")  # Warm F5's first inference once
-        except Exception:
-            logger.exception("F5-TTS warm-up failed (non-fatal)")
-    elif TTS_BACKEND == "phonon":
+    if TTS_BACKEND == "phonon":
         logger.info("Preloading Phonon model so the first spoken turn is fast ...")
         speech = PhononSynthesizer()
         try:
@@ -746,6 +673,7 @@ def prepare_models():
             logger.exception("Phonon warm-up failed (non-fatal)")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    # `processor` here is the Qwen3 tokenizer (run_room tokenizes with it).
     return models, translator, tokenizer
 
 
@@ -788,6 +716,8 @@ class Speaker:
         self.identity = identity
         self.segmenter = Segmenter()
         self.utterance_id = new_utterance_id()
+        # Source text held back by the translator, awaiting its continuation.
+        self.pending_source = ""
 
     def next_utterance(self) -> None:
         self.utterance_id = new_utterance_id()
@@ -871,13 +801,19 @@ class Transcriber:
             waveform = None
             try:
                 async with self.gpu_lock:
-                    translated = await asyncio.to_thread(
+                    speaker = self._speaker(identity)
+                    pending = speaker.pending_source
+                    translated, pending = await asyncio.to_thread(
                         translate_text,
                         self.translator,
                         self.processor,
                         source_text,
                         list(self.translation_context),
+                        pending,
                     )
+                    speaker.pending_source = pending
+                    if pending:
+                        logger.info("Holding %d chars of %s's source text back", len(pending), identity)
                     if not translated:
                         continue
                     self.translation_context.append((source_text, translated))
@@ -929,6 +865,13 @@ class Transcriber:
         enabled = message.get("audio_output")
         if isinstance(enabled, bool):
             self.audio_enabled[identity] = enabled
+
+    def _speaker(self, identity: str) -> Speaker:
+        speaker = self.speakers.get(identity)
+        if speaker is None:
+            speaker = Speaker(identity)
+            self.speakers[identity] = speaker
+        return speaker
 
     def _next_interim(self, name: str) -> Speaker | None:
         state = self.pipelines[name]
@@ -1057,17 +1000,7 @@ async def main() -> None:
     logger.info("LiveKit credentials are valid.")
     logger.info("ASR model: %s", COHERE_MODEL_NAME)
     logger.info("Translation model: %s", TRANSLATION_MODEL)
-    if TTS_BACKEND == "f5":
-        if not F5_REF_WAV or not F5_REF_TEXT:
-            logger.warning(
-                "TTS backend is f5 (F5-TTS) but F5_REF_WAV/F5_REF_TEXT are not set - "
-                "spoken output will fail until the reference clip is configured "
-                "(or set TTS_BACKEND=xtts)."
-            )
-        else:
-            logger.info("TTS backend: f5 (reference voice: %s, ODE steps: %d)", F5_REF_WAV, F5_NFE_STEPS)
-    else:
-        logger.info("TTS backend: xtts")
+    logger.info("TTS backend: %s%s", TTS_BACKEND, "" if TTS_BACKEND != "phonon" else f" (voice: {PHONON_VOICE})")
     logger.info("Max utterance length: %.2f s", MAX_UTTERANCE_SECONDS)
     logger.info("End-of-speech silence: %.2f s", END_SILENCE_SECONDS)
     logger.info("Max generated tokens per pass: %d", MAX_GEN_TOKENS)

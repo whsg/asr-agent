@@ -86,7 +86,7 @@
         </div>
         <div class="card">
           <h3>🤖 Colab (T4 GPU)</h3>
-          <p><code>bot.py</code>: shared Silero VAD + Cohere ASR + 4-bit TranslateGemma + optional F5-TTS spoken output (German fine-tune <code>aihpi/F5-TTS-German</code>); <code>TTS_BACKEND=xtts</code> selects XTTS-v2 instead.</p>
+          <p><code>bot.py</code>: shared Silero VAD + Cohere ASR + 4-bit TranslateGemma + optional spoken German output with Gradium Phonon (default, fixed voice e.g. <code>henrik</code>); <code>TTS_BACKEND=xtts</code> selects XTTS-v2 instead.</p>
         </div>
       </div>
 
@@ -104,7 +104,7 @@
             SEGC["Silero VAD<br/>shared sentence splitter"]
             ASRC["Cohere Transcribe Arabic<br/>cohere-transcript"]
             TR["TranslateGemma (4-bit)"]
-            TTS["F5-TTS (default), XTTS-v2 fallback<br/>German speech (opt.)"]
+            TTS["Phonon (default), XTTS-v2 alternate<br/>German speech (opt.)"]
             SEGC --> ASRC
             ASRC --> TR
             TR --> TTS
@@ -171,23 +171,21 @@
             <li><strong>Gated models:</strong> accept the terms for Cohere Transcribe Arabic and TranslateGemma on Hugging Face, then add an authorized <code>HF_TOKEN</code> to the <code>.env</code>.</li>
             <li><code>COHERE_4BIT=1</code> &mdash; optional; 4-bit-quantizes the Cohere ASR model to save VRAM.</li>
             <li><code>GEMMA_TRANSLATION_MODEL</code> &mdash; <code>google/translategemma-12b-it</code> (default, best quality) or <code>google/translategemma-4b-it</code> for a smaller/faster model that uses less VRAM.</li>
-            <li><strong>Spoken German output needs a reference voice</strong> &mdash; the default F5-TTS
-            engine is a voice-cloning model, so set <code>F5_REF_WAV</code> (a ~5&ndash;10 s wav of the
-            voice you want; a URL or a Colab file path) and <code>F5_REF_TEXT</code> (the exact text
-            spoken in that clip) in the <code>.env</code> before enabling "German speech output" in the
-            web app. Set <code>TTS_BACKEND=xtts</code> to use XTTS-v2 instead (no reference clip
-            needed &mdash; it picks a pre-made voice via <code>XTTS_SPEAKER</code> / <code>XTTS_SPEAKER_WAV</code>).</li>
-            <li>Other overrides: <code>LIVEKIT_ROOM</code>, <code>COHERE_MODEL</code>, <code>GEMMA_TRANSLATION_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>F5_GERMAN_REPO</code> / <code>F5_GERMAN_CKPT</code>, <code>MAX_UTTERANCE_SECONDS</code> (default 20 s, longer utterances are split).</li>
+                        <li><strong>Spoken German output uses a fixed voice</strong> &mdash; the default
+            Phonon engine (lightweight, 40M parameters) speaks with a fixed speaker from the
+            <code>gradium/phonon-voices</code> catalog, default <code>henrik</code>; change the voice with
+            <code>PHONON_VOICE</code> (no reference clip needed). Set <code>TTS_BACKEND=xtts</code> to use
+            XTTS-v2 instead (it picks a pre-made voice via <code>XTTS_SPEAKER</code> /
+            <code>XTTS_SPEAKER_WAV</code>).</li>
+                        <li>Other overrides: <code>LIVEKIT_ROOM</code>, <code>COHERE_MODEL</code>, <code>GEMMA_TRANSLATION_MODEL</code>, <code>TRANSLATION_SOURCE_LANG</code> / <code>TRANSLATION_TARGET_LANG</code> (default <code>ar</code> / <code>de</code>), <code>MAX_UTTERANCE_SECONDS</code> (default 20 s, longer utterances are split).</li>
           </ul>
         </li>
         <li>
           <strong>VRAM budget on a T4 (15.75 GB):</strong> Cohere ASR plus 4-bit TranslateGemma (12B or 4B)
           fits without TTS &mdash; pick the 4B model if you need extra headroom. Enable <code>COHERE_4BIT=1</code> to free
-          more memory. The TTS model is not loaded at startup
-          &mdash; it loads on the first spoken request (triggering a one-time ~2.7 GB checkpoint
-          download), and the German F5-TTS model uses ~4.1 GB on GPU (fp16), so leave that much
-          headroom before turning on the speech output; <code>TTS_BACKEND=xtts</code> uses the much
-          smaller XTTS-v2 instead.
+          more memory. The default Phonon model is tiny (40M parameters) and adds almost
+          no VRAM, so no extra headroom is needed before turning on the speech output;
+          <code>TTS_BACKEND=xtts</code> uses the much larger XTTS-v2 instead.
         </li>
         <li>
           <strong>Start the web app on your PC.</strong> Install

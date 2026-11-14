@@ -7,10 +7,8 @@ Live Arabic-to-German transcription and translation for a LiveKit room:
   translator. The Cohere model repository is gated and requires a Hugging Face
   account, accepted model terms, and `HF_TOKEN`. Qwen3 is public.
   - German speech output is optional per browser session and disabled by
-    default (engine chosen by env `TTS_BACKEND`: `f5` = F5-TTS, default,
-    `xtts` = XTTS-v2, or `phonon` = Gradium Phonon). For a German target, F5-TTS
-    uses the fine-tuned `aihpi/F5-TTS-German` model; other targets use the
-    standard F5-TTS base model. Phonon is a lightweight German model that
+    default (engine chosen by env `TTS_BACKEND`: `phonon` = Gradium Phonon,
+    default, or `xtts` = XTTS-v2). Phonon is a lightweight German model that
     speaks in a fixed voice from `gradium/phonon-voices` (default **Henrik**)
     instead of cloning a reference; its repo is gated. Enable **German speech output**
     before starting the microphone - the TTS model is downloaded and loaded
@@ -38,20 +36,14 @@ Live Arabic-to-German transcription and translation for a LiveKit room:
 | `TRANSLATION_MODEL` | `Qwen/Qwen3-4B-Instruct-2507` | Qwen3 translator model; public, no token needed |
 | `TRANSLATION_TARGET_LANG` | `de` | Target language for translation (ISO 639-1 code) |
 | `LIVEKIT_ROOM` | `arabic-asr-live` | Room name (must match the web server) |
-| `TTS_BACKEND` | `f5` | Speech engine: `f5` (F5-TTS), `xtts` (XTTS-v2), or `phonon` (Gradium Phonon) |
-| `F5_REF_WAV` | - | **Required for `f5`**: reference voice clip (~5-10 s wav) in the Colab runtime or an http(s) URL; for German use a German clip |
-| `F5_REF_TEXT` | - | **Required for `f5`**: the exact spoken text of the reference clip |
-| `F5_GERMAN_REPO` | `aihpi/F5-TTS-German` | German fine-tune used when the target language is German |
-| `F5_GERMAN_CKPT` | `F5TTS_Base/model_420000.safetensors` | Checkpoint inside that repo (`295000`, `365000`, `420000` available) |
-| `F5_USE_EMA` | `1` | Load EMA weights (recommended for the fully fine-tuned checkpoints) |
-| `F5_NFE_STEPS` | `8` | ODE inference steps, lower is faster |
+| `TTS_BACKEND` | `phonon` | Speech engine: `phonon` (Gradium Phonon, default) or `xtts` (XTTS-v2) |
 | `XTTS_SPEAKER` | - | XTTS-v2 speaker name (only used when `TTS_BACKEND=xtts`) |
 | `XTTS_SPEAKER_WAV` | - | XTTS-v2 reference voice path in Colab (only used when `TTS_BACKEND=xtts`) |
 | `PHONON_MODEL_NAME` | `gradium/phonon-40m-de` | Gradium Phonon model (only used when `TTS_BACKEND=phonon`; gated repo, needs `HF_TOKEN`) |
 | `PHONON_VOICE` | `henrik` | Speaker from [gradium/phonon-voices](https://huggingface.co/gradium/phonon-voices) by name, raw 16-char voice ID, or `default` (only used when `TTS_BACKEND=phonon`) |
 | `PHONON_TEMPERATURE` | `1.0` | Phonon temperature parameter (only used when `TTS_BACKEND=phonon`) |
 | `MAX_UTTERANCE_SECONDS` | `20.0` | Longest utterance (seconds) sent to the ASR, then split |
-| `TRANSLATION_CONTEXT_TURNS` | `6` | Number of previous translations to use as context for consistency |
+| `TRANSLATION_CONTEXT_TURNS` | `5` | Number of previous source/translation pairs sent as context; the translator also holds back source text whose meaning is incomplete until its continuation arrives |
 
 **Hugging Face setup:** accept the model terms for
 [Cohere Transcribe Arabic](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026)
@@ -59,16 +51,15 @@ Live Arabic-to-German transcription and translation for a LiveKit room:
 [gradium/phonon-40m-de](https://huggingface.co/gradium/phonon-40m-de) (and
 `gradium/phonon-voices`) — then set an authorized `HF_TOKEN` in `.env` or
 Colab Secrets. Colab downloads Cohere weights into its runtime. Qwen3 is
-public and needs no token. F5-TTS and Phonon weights download the first time
+public and needs no token. Phonon weights download the first time
 speech output is requested. Note that Phonon needs a transformers build with
 `GradiumPhononTTSForConditionalGeneration`
 (`pip install -U 'git+https://github.com/huggingface/transformers'`).
 
 **VRAM on a T4 (15.75 GB):** Cohere ASR plus the 4-bit Qwen3
-translator run without TTS. F5-TTS adds the DiT model plus
-the Vococodec/Vocoder (fp16 weights of the ~1.35 GB German checkpoint), which
-fits in the remaining headroom; XTTS-v2 is comparable. Phonon is lightweight
-(40M parameters) and uses much less VRAM than F5-TTS or XTTS-v2. Set
+translator run without TTS. The default Phonon engine is lightweight
+(40M parameters) and fits easily in the remaining headroom;
+XTTS-v2 uses noticeably more RAM/VRAM. Set
 `COHERE_4BIT=1` if you need more headroom.
 
 ## 2. Web client on your PC
@@ -90,17 +81,13 @@ pause.
 
 The Colab runtime needs a GPU with enough memory for Cohere ASR, the 4-bit
 Qwen3 translator, and optionally the TTS engine (see the VRAM
-notes above). F5-TTS (`TTS_BACKEND=f5`, default) is a voice-cloning model:
-set `F5_REF_WAV` to a short reference clip (~5-10 s wav of the desired
-voice, in the Colab runtime or as an http(s) URL) and `F5_REF_TEXT` to its
-exact spoken text. Check the F5-TTS / German fine-tune licenses before using
-them commercially. With `TTS_BACKEND=xtts`, XTTS-v2 uses a built-in German
-speaker by default; to use a reference voice there, set `XTTS_SPEAKER_WAV`
-to an audio file available in the Colab runtime. With `TTS_BACKEND=phonon`,
-the lightweight Gradium Phonon model is used—it speaks in a fixed voice from
-the `gradium/phonon-voices` catalog (default **Henrik**, a German male voice;
-change with `PHONON_VOICE`) instead of cloning a reference, and is more
-VRAM-efficient than F5-TTS or XTTS-v2.
+notes above). The default engine, Gradium Phonon (`TTS_BACKEND=phonon`),
+speaks in a fixed voice from the `gradium/phonon-voices` catalog (default
+**Henrik**, a German male voice; change with `PHONON_VOICE`) instead of
+cloning a reference. Note that Phonon's model/voice repos are CC BY-NC, so
+check the license before commercial use. With `TTS_BACKEND=xtts`, XTTS-v2
+uses a built-in German speaker by default; to use a reference voice there,
+set `XTTS_SPEAKER_WAV` to an audio file available in the Colab runtime.
 
 All bot environment variables are documented in the table above and in
 [.env.example](./.env.example).
