@@ -68,6 +68,26 @@ def test_phonon_rejects_empty_or_non_finite_audio(phonon, output):
         engine.synthesize("Guten Morgen.")
 
 
+def test_phonon_threads_are_set_before_the_model_loads(phonon, monkeypatch):
+    order = []
+
+    def set_num_threads(count):
+        order.append(("threads", count, len(FakeTTS.instances)))
+
+    monkeypatch.setitem(sys.modules, "ptts", SimpleNamespace(TTS=FakeTTS, set_num_threads=set_num_threads))
+    monkeypatch.setattr(phonon, "PHONON_THREADS", 2)
+    phonon.PhononSynthesizer().load()
+    assert order == [("threads", 2, 0)], "the global pool must be sized before TTS() is created"
+
+
+def test_phonon_threads_default_leaves_the_library_alone(phonon, monkeypatch):
+    calls = []
+    monkeypatch.setitem(sys.modules, "ptts", SimpleNamespace(TTS=FakeTTS, set_num_threads=calls.append))
+    monkeypatch.setattr(phonon, "PHONON_THREADS", 0)
+    phonon.PhononSynthesizer().load()
+    assert calls == []
+
+
 def test_phonon_load_error_explains_gated_model(phonon, monkeypatch):
     def refuse(*args, **kwargs):
         raise PermissionError("401 Client Error: gated repo")

@@ -95,6 +95,16 @@ class RealtimeAudioSource:
         self.busy_until = time.monotonic()
 
 
+class CountingAudioSource:
+    """Counts how much audio was pushed, without waiting for playback."""
+
+    def __init__(self) -> None:
+        self.samples = 0
+
+    async def capture_frame(self, frame) -> None:
+        self.samples += frame.samples_per_channel
+
+
 def make_pipeline(bot, *, asr=None, translator=None, speech=None, source=None, concurrency=2):
     room = FakeRoom()
     audio_source = source if source is not None else RealtimeAudioSource()
@@ -440,10 +450,10 @@ def test_chunking_never_loses_text(bot):
                     break
                 index += 1
                 chunks.append(chunk)
-        rest, _ = bot.split_speakable(buffer, index, flush=True)
-        if rest:
-            chunks.append(rest)
+        rest = bot.final_chunks(buffer, index)
+        chunks.extend(rest)
         assert " ".join(chunks).split() == text.split(), text
+        assert all(len(chunk) <= bot.TTS_MAX_CHUNK_CHARS for chunk in rest), text
 
 
 def test_chunks_grow_so_a_turn_needs_few_tts_calls(bot):
@@ -472,6 +482,41 @@ def test_chunks_grow_so_a_turn_needs_few_tts_calls(bot):
     assert len(chunks) <= 5, f"{len(chunks)} TTS calls for {len(text)} characters is too many"
     assert len(chunks[0]) <= bot.TTS_MAX_CHUNK_CHARS // 2, "the first chunk must stay short"
     assert len(chunks[2]) > len(chunks[0]), "later chunks must grow"
+
+
+def test_a_translation_without_punctuation_is_still_cut_into_speakable_chunks(bot):
+    """One 34-second TTS call cost a live run a 47-second backlog.
+
+    Without sentence punctuation nothing triggers a streaming cut, so the whole
+    translation used to reach the TTS as a single flushed chunk.
+    """
+    text = " ".join(["Wort"] * 300)
+    chunks = bot.final_chunks(text, 0)
+
+    assert " ".join(chunks).split() == text.split()
+    assert all(len(chunk) <= bot.TTS_MAX_CHUNK_CHARS for chunk in chunks)
+    assert len(chunks) > 1
+
+
+def test_unpronounceable_chunks_never_reach_the_tts(bot):
+    """Phonon raises on text without a single alphanumeric character."""
+    assert not bot.is_speakable("...")
+    assert not bot.is_speakable(" » – , ")
+    assert bot.is_speakable("Ja.")
+
+    async def scenario():
+        speech = FakeSpeech()
+        pipeline, _, _ = make_pipeline(bot, speech=speech)
+        worker = asyncio.create_task(pipeline.run_tts())
+        turn = utterance(bot, 0)
+        pipeline.tts_queue.put_nowait((turn, "...", False))
+        pipeline.tts_queue.put_nowait((turn, "Guten Morgen.", True))
+        await asyncio.wait_for(pipeline.tts_queue.join(), timeout=2)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return speech.texts
+
+    assert asyncio.run(scenario()) == ["Guten Morgen."]
 
 
 def test_a_single_turn_is_never_cut_in_half(bot, monkeypatch):
@@ -516,3 +561,112 @@ def test_whole_turns_are_skipped_when_the_agent_falls_behind(bot, monkeypatch):
     for turn in turns:
         chunks = [c for c in remaining if c.turn.utterance_id == turn.utterance_id]
         assert len(chunks) in (0, 2), "a turn was cut in half"
+
+
+# ---------------------------------------------------------------------------
+# Catching up by speaking faster
+# ---------------------------------------------------------------------------
+
+
+def tone(bot, seconds: float, hz: float = 140.0) -> np.ndarray:
+    """A buzz close to a speaking voice, so splice artefacts are measurable."""
+    t = np.arange(int(bot.AUDIO_SAMPLE_RATE * seconds)) / bot.AUDIO_SAMPLE_RATE
+    return (0.4 * np.sin(2 * np.pi * hz * t)).astype(np.float32)
+
+
+def dominant_hz(bot, audio: np.ndarray) -> float:
+    spectrum = np.abs(np.fft.rfft(audio * np.hanning(audio.size)))
+    return float(np.fft.rfftfreq(audio.size, 1 / bot.AUDIO_SAMPLE_RATE)[int(np.argmax(spectrum))])
+
+
+@pytest.mark.parametrize("speed", [1.1, 1.25, 1.5])
+def test_time_stretch_shortens_the_audio_but_not_the_pitch(bot, speed):
+    """The whole point over plain resampling: a faster speaker, not a chipmunk."""
+    audio = tone(bot, 3.0)
+    out = bot.time_stretch(audio, speed)
+
+    assert np.isfinite(out).all()
+    assert out.size == pytest.approx(audio.size / speed, rel=0.05)
+    assert dominant_hz(bot, out) == pytest.approx(dominant_hz(bot, audio), abs=2.0)
+    loudness = lambda x: float(np.sqrt(np.mean(np.square(x))))  # noqa: E731
+    assert loudness(out) == pytest.approx(loudness(audio), rel=0.2)
+
+
+def test_time_stretch_leaves_normal_speed_untouched(bot):
+    audio = tone(bot, 1.0)
+    assert bot.time_stretch(audio, 1.0) is audio
+
+
+def test_a_turn_reports_how_much_german_it_made_per_second_of_arabic(bot, caplog):
+    """The ratio that decides whether the agent can keep up at all.
+
+    Above 1.0 the backlog grows on every continuous minute no matter how fast
+    the models are, so it belongs in the per-turn line, not in a later symptom.
+    """
+    pipeline, _, _ = make_pipeline(bot)
+    turn = utterance(bot, 0, seconds=2.0)
+    turn.chunks = 1
+    turn.tts_ms = 500.0
+    turn.audio_seconds = 6.0
+
+    with caplog.at_level("INFO", logger="asr-bot"):
+        pipeline._log_turn(turn)
+
+    assert "3.00x speech" in caplog.text
+    assert "6.0s of German for 2.0s of Arabic" in caplog.text
+
+
+def test_playout_speed_ramps_up_only_once_the_agent_is_behind(bot, monkeypatch):
+    pipeline, _, _ = make_pipeline(bot)
+    monkeypatch.setattr(bot, "SPEEDUP_BACKLOG_SECONDS", 2.0)
+    monkeypatch.setattr(bot, "MAX_AUDIO_BACKLOG_SECONDS", 10.0)
+    monkeypatch.setattr(bot, "MAX_PLAYOUT_SPEED", 1.25)
+
+    pipeline._playout_backlog = 1.5
+    assert pipeline._playout_speed() == 1.0, "no speed-up while the agent keeps up"
+    pipeline._playout_backlog = 6.0
+    assert 1.0 < pipeline._playout_speed() < 1.25
+    # Full speed exactly where dropping would otherwise start.
+    pipeline._playout_backlog = 10.0
+    assert pipeline._playout_speed() == pytest.approx(1.25)
+
+
+def play_backlog(bot, max_speed: float) -> tuple[float, float]:
+    """Plays four queued seconds and returns (samples pushed, speed used)."""
+
+    async def scenario():
+        source = CountingAudioSource()
+        pipeline, _, _ = make_pipeline(bot, source=source)
+        worker = asyncio.create_task(pipeline.run_playout())
+        turn = utterance(bot, 0)
+        one_second = tone(bot, 1.0)
+        for index in range(4):
+            pipeline._enqueue_playout(bot.AudioChunk(turn, one_second, last=index == 3))
+        await pipeline.playout_queue.join()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return source.samples, turn.played_speed
+
+    return asyncio.run(scenario())
+
+
+def test_a_backlog_is_spoken_faster_instead_of_being_skipped(bot, monkeypatch):
+    """Dropping is the last resort: a skipped sentence is content, lost for good.
+
+    The listener tolerates a quicker interpreter, so a backlog is first paid for
+    with tempo - only what tempo cannot absorb reaches _drop_backlog().
+    """
+    monkeypatch.setattr(bot, "SPEEDUP_BACKLOG_SECONDS", 0.5)
+    monkeypatch.setattr(bot, "MAX_AUDIO_BACKLOG_SECONDS", 6.0)
+
+    monkeypatch.setattr(bot, "MAX_PLAYOUT_SPEED", 1.0)
+    baseline, baseline_speed = play_backlog(bot, 1.0)
+    monkeypatch.setattr(bot, "MAX_PLAYOUT_SPEED", 1.25)
+    caught_up, speed = play_backlog(bot, 1.25)
+
+    assert baseline_speed == 1.0
+    assert 1.0 < speed <= 1.25
+    assert caught_up < baseline, "the same four seconds must leave sooner"
+    # Every chunk still went out; only its duration changed.
+    assert caught_up > baseline / 1.25
+

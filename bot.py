@@ -17,7 +17,8 @@ finished clause is spoken immediately instead of waiting for the whole
 sentence, which is what keeps the spoken output close to real time.
 
 Models run on one or more GPUs (see ASR_DEVICE / TRANSLATION_DEVICE); the
-default Phonon TTS runs on the CPU.
+translator can also run as a local llama.cpp server (TRANSLATION_ENGINE), and
+the default Phonon TTS runs on the CPU.
 """
 from __future__ import annotations
 
@@ -133,6 +134,35 @@ TRANSLATION_4BIT = _env_flag("TRANSLATION_4BIT")
 # is float16 (e.g. T4): Gemma 3 activations exceed float16's 65504 maximum, which
 # yields NaN logits and only special tokens, so auto uses bfloat16 there.
 TRANSLATION_DTYPE = os.getenv("TRANSLATION_DTYPE", "auto").strip().lower() or "auto"
+# Runtime of the translator:
+#   transformers - in-process PyTorch model (TRANSLATION_4BIT / TRANSLATION_DTYPE apply).
+#   llamacpp     - a local llama-server process running a GGUF of the same model.
+#                  On a T4 it uses fp16 tensor cores with fp32 accumulation, so
+#                  Gemma 3 neither overflows nor needs slow bf16 emulation, and
+#                  8-bit (Q8_0) keeps nearly the full model quality.
+# The prompt/template is identical: token ids still come from the official
+# processor of TRANSLATION_MODEL.
+TRANSLATION_ENGINE = os.getenv("TRANSLATION_ENGINE", "transformers").strip().lower()
+if TRANSLATION_ENGINE not in ("transformers", "llamacpp"):
+    raise ValueError("TRANSLATION_ENGINE must be transformers or llamacpp.")
+LLAMA_SERVER_BIN = os.getenv("LLAMA_SERVER_BIN", "").strip() or "llama-server"
+# GGUF of TRANSLATION_MODEL: a Hugging Face repo + file name, or a local file path.
+# The defaults are the TranslateGemma 12B GGUF, so any other model needs its own.
+if (TRANSLATION_ENGINE == "llamacpp" and TRANSLATION_BACKEND != "translategemma"
+        and not os.getenv("LLAMA_GGUF_FILE", "").strip()):
+    raise ValueError("TRANSLATION_ENGINE=llamacpp with a non-TranslateGemma model needs "
+                     "LLAMA_GGUF_REPO/LLAMA_GGUF_FILE for a GGUF of TRANSLATION_MODEL.")
+LLAMA_GGUF_REPO = os.getenv("LLAMA_GGUF_REPO", "").strip() or "mradermacher/translategemma-12b-it-GGUF"
+LLAMA_GGUF_FILE = os.getenv("LLAMA_GGUF_FILE", "").strip() or "translategemma-12b-it.Q8_0.gguf"
+# Context window: TranslateGemma's 2048 input tokens plus the output budget.
+LLAMA_CTX = _env_int("LLAMA_CTX", 3072, minimum=512)
+# The model runs fully on the GPU; CPU threads only feed it. Few threads and no
+# busy-wait polling leave the cores to the CPU TTS.
+LLAMA_THREADS = _env_int("LLAMA_THREADS", 1)
+LLAMA_STARTUP_SECONDS = _env_positive_float("LLAMA_STARTUP_SECONDS", 900.0)
+LLAMA_SERVER_LOG = os.getenv("LLAMA_SERVER_LOG", "").strip() or "llama-server.log"
+# CPU threads for PyTorch's CPU ops (VAD, feature extraction); 0 = PyTorch default.
+TORCH_CPU_THREADS = _env_int("TORCH_CPU_THREADS", 0, minimum=0)
 # System prompt for the translator. The default is tuned for a Friday sermon
 # (Jumu'ah khutba); set to an empty value for the plain "translate, no
 # explanation" prompt.
@@ -146,9 +176,11 @@ TRANSLATION_SYSTEM_PROMPT = os.getenv("TRANSLATION_SYSTEM_PROMPT", "").strip() o
     "repetition of the {src} source."
 ).format(src=TRANSLATION_SOURCE_LANG, tgt=TRANSLATION_TARGET_LANG)
 # How many previous (source, translation) pairs to send as chat context so the
-# translator stays consistent across turns (0 disables the context). Every turn
-# of context is re-prefilled on each request, so this trades latency for
-# consistency; 4 is a good balance.
+# translator stays consistent across turns (0 disables the context). This is
+# the only way a VAD fragment ever sees the discourse it belongs to, which
+# matters most for pronouns and recurring names in a sermon. Every turn of
+# context is re-prefilled on each request, so it trades latency for quality;
+# 4 is a good balance, less for TranslateGemma's 2048-token input window.
 TRANSLATION_CONTEXT_TURNS = _env_int("TRANSLATION_CONTEXT_TURNS", 4, minimum=0)
 # Hard ceiling for generated tokens, shared by the ASR and the translator. The
 # effective limit per request is derived from the input, so normal turns stop
@@ -177,6 +209,9 @@ XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 # commercial use without an agreement with Gradium. Empty voice = model default.
 PHONON_MODEL = os.getenv("PHONON_MODEL", "hf://gradium/phonon-40m-de").strip()
 PHONON_VOICE = os.getenv("PHONON_VOICE", "").strip()
+# CPU threads for Phonon's synthesis pool (0 = library default, i.e. all cores).
+# Capping it keeps cores free for the VAD, ASR feeding and the event loop.
+PHONON_THREADS = _env_int("PHONON_THREADS", 0, minimum=0)
 
 # Speak each finished clause as soon as the translator has produced it instead
 # of waiting for the full sentence. This is the single biggest win for
@@ -201,10 +236,21 @@ AUDIO_FRAME_SAMPLES = AUDIO_SAMPLE_RATE // 50
 AUDIO_QUEUE_MS = _env_int("AUDIO_QUEUE_MS", 800)
 # Silence inserted between two turns so they do not run into each other.
 TURN_GAP_SECONDS = 0.12
-# If the agent falls behind by more than this many seconds of unplayed audio,
-# the oldest pending chunks are dropped. Without this the lag grows forever as
-# soon as synthesis is slower than real time.
+# Falling behind is answered by speaking faster before anything is dropped: a
+# listener tolerates a quicker interpreter, but a skipped sentence is content
+# they never get back. Playout is compressed in time only, so the pitch is
+# unchanged. 1.0 disables the catch-up and restores drop-only behaviour.
+MAX_PLAYOUT_SPEED = _env_positive_float("MAX_PLAYOUT_SPEED", 1.25)
+# Backlog at which the speed-up starts; it reaches MAX_PLAYOUT_SPEED exactly
+# where MAX_AUDIO_BACKLOG_SECONDS would begin to drop turns.
+SPEEDUP_BACKLOG_SECONDS = _env_positive_float("SPEEDUP_BACKLOG_SECONDS", 2.0)
+# Last resort: if even the faster playout cannot keep up, the oldest unplayed
+# turns are dropped. Without this the lag grows forever.
 MAX_AUDIO_BACKLOG_SECONDS = _env_positive_float("MAX_AUDIO_BACKLOG_SECONDS", 10.0)
+# The ratio that actually decides whether the agent can keep up: seconds of
+# synthesised German per second of Arabic speech. Above 1.0 the backlog grows
+# no matter how fast the models are, so outliers are reported per turn.
+OUTPUT_EXPANSION_WARNING = _env_positive_float("OUTPUT_EXPANSION_WARNING", 2.0)
 
 # --- Scheduling ------------------------------------------------------------
 # How many model calls may occupy the GPU at once. >1 lets the Python-side
@@ -635,6 +681,24 @@ def stage_schedulers() -> tuple[GpuScheduler, GpuScheduler, GpuScheduler]:
     return schedulers[devices[0]], schedulers[devices[1]], schedulers[devices[2]]
 
 
+def pin_cuda_device() -> None:
+    """Makes the ASR GPU the calling thread's current CUDA device (llamacpp engine).
+
+    The current CUDA device is per thread and defaults to 0. An unpinned CUDA
+    call would then create a stray context of a few hundred MiB on GPU 0,
+    which llama-server fills almost completely. Runs as the initializer of
+    every model worker thread.
+    """
+    if TRANSLATION_ENGINE != "llamacpp" or not torch.cuda.is_available():
+        return
+    try:
+        device = pick_device_dtype(ASR_DEVICE)[1]
+        if device not in ("cpu", pick_device_dtype(TRANSLATION_DEVICE)[1]):
+            torch.cuda.set_device(int(device.split(":")[1]))
+    except Exception:  # noqa: BLE001 - invalid placement is reported by prepare_models
+        logger.debug("Could not pin the CUDA device", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # ASR
 # ---------------------------------------------------------------------------
@@ -709,6 +773,133 @@ class AsrEngine:
 # ---------------------------------------------------------------------------
 
 
+def load_chat_template(owner, load_kwargs: dict) -> None:
+    """Sets owner.backend/.processor/.tokenizer from TRANSLATION_MODEL."""
+    from transformers import AutoProcessor, AutoTokenizer
+
+    owner.backend = TRANSLATION_BACKEND
+    if owner.backend == "translategemma":
+        owner.processor = AutoProcessor.from_pretrained(TRANSLATION_MODEL, **load_kwargs)
+        owner.tokenizer = owner.processor.tokenizer
+    else:
+        owner.tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL, **load_kwargs)
+
+
+# TranslateGemma's documented input context, shared by every model size.
+GEMMA_MAX_INPUT_TOKENS = 2048
+# Cleared once if the installed template refuses earlier turns, so a template
+# change downgrades to context-free translation instead of killing every turn.
+_gemma_context_supported = True
+_gemma_context_error = ""
+
+
+def _gemma_messages(text: str, context: list[tuple[str, str]]) -> list[dict]:
+    """TranslateGemma chat turns: its template knows only user and assistant.
+
+    The discourse context is therefore carried as previously translated turns
+    rather than as a prompt - which is the whole point for a sermon, where
+    pronouns and recurring names only resolve against what came before.
+    """
+    def request(source: str) -> dict:
+        return {
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "source_lang_code": TRANSLATION_SOURCE_LANG,
+                "target_lang_code": TRANSLATION_TARGET_LANG,
+                "text": source,
+            }],
+        }
+
+    messages: list[dict] = []
+    for previous_source, previous_target in context:
+        messages.append(request(previous_source))
+        # Its template rejects a content list on the assistant role.
+        messages.append({"role": "assistant", "content": previous_target})
+    messages.append(request(text))
+    return messages
+
+
+def _gemma_prompt(owner, messages: list[dict]):
+    """Renders the official template, then tokenizes - deliberately in two steps.
+
+    The processor's tokenizing path scans every message for images and assumes
+    each content is a list of dicts, while TranslateGemma's own template
+    requires the assistant role to carry a plain string. Rendering text-only is
+    the only way to satisfy both, and this agent never sends an image anyway.
+    """
+    prompt = owner.processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    bos = getattr(owner.tokenizer, "bos_token", None)
+    return owner.tokenizer(
+        prompt, add_special_tokens=not (bos and prompt.startswith(bos)), return_tensors="pt",
+    )
+
+
+def _gemma_inputs(owner, text: str, context: list[tuple[str, str]]):
+    """Token ids for TranslateGemma, with as much context as its input window fits."""
+    global _gemma_context_supported, _gemma_context_error
+
+    history = list(context) if _gemma_context_supported else []
+    while True:
+        try:
+            inputs = _gemma_prompt(owner, _gemma_messages(text, history))
+        except Exception as exc:  # noqa: BLE001 - without context this is a real failure
+            if not history:
+                raise
+            _gemma_context_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("TranslateGemma's chat template rejected the earlier turns (%s); "
+                           "translating each turn in isolation from now on.",
+                           _gemma_context_error, exc_info=True)
+            _gemma_context_supported = False
+            history = []
+            continue
+        if inputs["input_ids"].shape[1] <= GEMMA_MAX_INPUT_TOKENS:
+            return inputs
+        if not history:
+            raise ValueError(
+                "TranslateGemma input exceeds its documented 2048-token input context. "
+                "Shorten MAX_UTTERANCE_SECONDS; source text was not truncated."
+            )
+        history.pop(0)  # the oldest context turn is the cheapest thing to lose
+
+
+def chat_inputs(owner, text: str, context: list[tuple[str, str]]):
+    """Prompt token ids (with attention mask) on the CPU, from the official template."""
+    if owner.backend == "translategemma":
+        return _gemma_inputs(owner, text, context)
+    messages: list[dict[str, str]] = []
+    if TRANSLATION_SYSTEM_PROMPT:
+        messages.append({"role": "system", "content": TRANSLATION_SYSTEM_PROMPT})
+    # Interleaved source/translation pairs. Sending all sources first and
+    # all translations afterwards (as an earlier version did) destroys the
+    # few-shot pattern and measurably degrades the output.
+    for previous_source, previous_target in context:
+        messages.append({"role": "user", "content": previous_source})
+        messages.append({"role": "assistant", "content": previous_target})
+    messages.append({"role": "user", "content": text})
+    # enable_thinking=False: some Qwen3 instruct models think with a
+    # reasoning block by default, which is slow and can eat the whole output
+    # budget before reaching the translation. Templates without a thinking
+    # branch simply ignore the kwarg.
+    return owner.tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=False,
+        return_dict=True,
+        return_tensors="pt",
+    )
+
+
+def translation_budget(source_tokens: int) -> int:
+    # German can be noticeably longer than the Arabic source, so budget
+    # generously: this cap exists to stop a degenerate repetition loop,
+    # not to shorten a legitimate translation.
+    return max(64, min(MAX_GEN_TOKENS, int(source_tokens * TRANSLATION_TOKEN_RATIO) + 48))
+
+
 class Translator:
     """Qwen3 or TranslateGemma translator with token streaming.
 
@@ -717,17 +908,10 @@ class Translator:
     """
 
     def __init__(self, dtype, device: str) -> None:
-        from transformers import AutoProcessor, AutoTokenizer
-
-        self.backend = TRANSLATION_BACKEND
         load_kwargs: dict = {}
         if HF_TOKEN:
             load_kwargs["token"] = HF_TOKEN
-        if self.backend == "translategemma":
-            self.processor = AutoProcessor.from_pretrained(TRANSLATION_MODEL, **load_kwargs)
-            self.tokenizer = self.processor.tokenizer
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL, **load_kwargs)
+        load_chat_template(self, load_kwargs)
         self.quantized = TRANSLATION_4BIT
         self.dtype = dtype
         # Set by stream(): True when the last request ran into its token budget.
@@ -773,50 +957,7 @@ class Translator:
         )
 
     def _build_inputs(self, text: str, context: list[tuple[str, str]]):
-        if self.backend == "translategemma":
-            # TranslateGemma's official template accepts structured translation
-            # requests, not a system prompt or arbitrary chat instructions.
-            messages = [{
-                "role": "user",
-                "content": [{
-                    "type": "text",
-                    "source_lang_code": TRANSLATION_SOURCE_LANG,
-                    "target_lang_code": TRANSLATION_TARGET_LANG,
-                    "text": text,
-                }],
-            }]
-            inputs = self.processor.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True,
-                return_dict=True, return_tensors="pt",
-            )
-            if inputs["input_ids"].shape[1] > 2048:
-                raise ValueError(
-                    "TranslateGemma input exceeds its documented 2048-token input context. "
-                    "Shorten MAX_UTTERANCE_SECONDS; source text was not truncated."
-                )
-            return inputs.to(self.model.device)
-        messages: list[dict[str, str]] = []
-        if TRANSLATION_SYSTEM_PROMPT:
-            messages.append({"role": "system", "content": TRANSLATION_SYSTEM_PROMPT})
-        # Interleaved source/translation pairs. Sending all sources first and
-        # all translations afterwards (as an earlier version did) destroys the
-        # few-shot pattern and measurably degrades the output.
-        for previous_source, previous_target in context:
-            messages.append({"role": "user", "content": previous_source})
-            messages.append({"role": "assistant", "content": previous_target})
-        messages.append({"role": "user", "content": text})
-        # enable_thinking=False: some Qwen3 instruct models think with a
-        # reasoning block by default, which is slow and can eat the whole output
-        # budget before reaching the translation. Templates without a thinking
-        # branch simply ignore the kwarg.
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=False,
-            return_dict=True,
-            return_tensors="pt",
-        ).to(self.model.device)
+        return chat_inputs(self, text, context).to(self.model.device)
 
     def stream(self, text: str, context: list[tuple[str, str]], emit) -> None:
         """Generates the translation and calls `emit(piece)` for each new piece."""
@@ -826,12 +967,7 @@ class Translator:
             inputs = self._build_inputs(text, context)
             input_len = inputs["input_ids"].shape[1]
             source_tokens = len(self.tokenizer(text)["input_ids"])
-            # German can be noticeably longer than the Arabic source, so budget
-            # generously: this cap exists to stop a degenerate repetition loop,
-            # not to shorten a legitimate translation.
-            budget = max(
-                64, min(MAX_GEN_TOKENS, int(source_tokens * TRANSLATION_TOKEN_RATIO) + 48)
-            )
+            budget = translation_budget(source_tokens)
             streamer = TextIteratorStreamer(
                 self.tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=120.0
             )
@@ -877,6 +1013,297 @@ class Translator:
         return "".join(parts).strip()
 
 
+def _physical_gpu(device: str) -> str:
+    """The CUDA_VISIBLE_DEVICES entry behind a cuda:N index of this process."""
+    index = int(device.split(":")[1])
+    visible = [item.strip() for item in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+               if item.strip()]
+    if not visible:
+        return str(index)
+    if index >= len(visible):
+        raise RuntimeError(f"{device} is not in CUDA_VISIBLE_DEVICES={','.join(visible)}.")
+    return visible[index]
+
+
+def _gpu_memory_report(stage: str, device: str) -> None:
+    """VRAM use via nvidia-smi, without creating a PyTorch context on that GPU."""
+    import subprocess
+
+    if device == "cpu":
+        return
+    try:
+        output = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits",
+             "-i", _physical_gpu(device)],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+        used, total = (float(value) for value in output.split(","))
+    except Exception:  # noqa: BLE001 - a missing report must not stop the agent
+        logger.debug("nvidia-smi memory query failed", exc_info=True)
+        return
+    logger.info("VRAM after %s on %s: %.1f GiB used of %.1f GiB", stage, device,
+                used / 1024, total / 1024)
+
+
+class LlamaServer:
+    """A llama-server child process that serves one GGUF on one GPU.
+
+    Started early so it loads the weights while the ASR and TTS load. Only the
+    selected GPU is visible to it, and every layer must fit there: a partial
+    CPU offload would be an order of magnitude slower, so it fails instead.
+    """
+
+    PID_FILE = Path(os.getenv("TMPDIR", "/tmp")) / f"asr-agent-llama-server-{getattr(os, 'getuid', int)()}.pid"
+    running: set = set()
+
+    def __init__(self, device: str) -> None:
+        self.device = device
+        self.process = None
+        self.url = ""
+        self.model_path = ""
+        self.log_path = Path(LLAMA_SERVER_LOG).resolve()
+
+    @staticmethod
+    def binary() -> str:
+        import shutil
+
+        found = shutil.which(LLAMA_SERVER_BIN)
+        if found:
+            return found
+        raise RuntimeError(
+            f"llama-server not found at LLAMA_SERVER_BIN={LLAMA_SERVER_BIN!r}. Build it with the "
+            "notebook's install cell, or set TRANSLATION_ENGINE=transformers."
+        )
+
+    @staticmethod
+    def resolve_model() -> str:
+        if os.path.isfile(LLAMA_GGUF_FILE):
+            return LLAMA_GGUF_FILE
+        from huggingface_hub import hf_hub_download
+
+        logger.info("Downloading %s from %s (cached after the first run) ...",
+                    LLAMA_GGUF_FILE, LLAMA_GGUF_REPO)
+        return hf_hub_download(LLAMA_GGUF_REPO, LLAMA_GGUF_FILE, token=HF_TOKEN)
+
+    def command(self, binary: str, port: int) -> list[str]:
+        return [
+            binary, "-m", self.model_path, "--host", "127.0.0.1", "--port", str(port),
+            "-ngl", "999", "--fit", "off", "-c", str(LLAMA_CTX), "-np", "1",
+            "-t", str(LLAMA_THREADS), "-tb", str(LLAMA_THREADS), "--poll", "0",
+            "-cram", "0", "--no-webui",
+        ]
+
+    def environment(self) -> dict:
+        env = os.environ.copy()
+        if self.device == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+        else:
+            env["CUDA_VISIBLE_DEVICES"] = _physical_gpu(self.device)
+        return env
+
+    def start(self) -> None:
+        import atexit
+        import socket
+        import subprocess
+
+        binary = self.binary()
+        self._kill_stale()
+        self.model_path = self.resolve_model()
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        self.url = f"http://127.0.0.1:{port}"
+        logger.info("Starting llama-server on %s with %s ...", self.device, Path(self.model_path).name)
+        with self.log_path.open("w", encoding="utf-8") as log:
+            self.process = subprocess.Popen(
+                self.command(binary, port), env=self.environment(), stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT,
+            )
+        self.PID_FILE.write_text(str(self.process.pid))
+        LlamaServer.running.add(self)
+        atexit.register(self.stop)
+
+    def _kill_stale(self) -> None:
+        """Stops a server left behind by a killed previous run; it would hold the VRAM."""
+        import signal
+
+        try:
+            pid = int(self.PID_FILE.read_text().strip())
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except (OSError, ValueError):
+            return
+        if b"llama-server" not in cmdline:
+            return
+        logger.warning("Stopping a llama-server (pid %d) left over from a previous run.", pid)
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while self._alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            return False
+        return state != "Z"  # a zombie holds no GPU memory any more
+
+    def log_tail(self, lines: int = 25) -> str:
+        try:
+            return "\n".join(self.log_path.read_text(errors="replace").splitlines()[-lines:])
+        except OSError:
+            return "(no llama-server log)"
+
+    def wait_ready(self) -> None:
+        import urllib.error
+        import urllib.request
+
+        deadline = time.monotonic() + LLAMA_STARTUP_SECONDS
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    f"llama-server exited with code {self.process.returncode} while loading "
+                    f"(full log: {self.log_path}). Last lines:\n{self.log_tail()}"
+                )
+            try:
+                with urllib.request.urlopen(self.url + "/health", timeout=5) as response:
+                    if response.status == 200:
+                        return
+            except (urllib.error.URLError, OSError):
+                pass
+            time.sleep(0.5)
+        raise RuntimeError(f"llama-server was not ready after {LLAMA_STARTUP_SECONDS:.0f} s "
+                           f"(full log: {self.log_path}). Last lines:\n{self.log_tail()}")
+
+    def stop(self) -> None:
+        LlamaServer.running.discard(self)
+        process, self.process = self.process, None
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except Exception:  # noqa: BLE001 - escalate to a hard kill
+            process.kill()
+        with contextlib.suppress(OSError):
+            if self.PID_FILE.read_text().strip() == str(process.pid):
+                self.PID_FILE.unlink()
+
+
+class LlamaCppTranslator:
+    """TRANSLATION_MODEL served by llama.cpp (TRANSLATION_ENGINE=llamacpp).
+
+    The prompt is rendered and tokenized by the official processor, exactly as
+    for the transformers engine, and sent as token ids, so llama-server adds no
+    second BOS and applies no template of its own. Decoding is greedy.
+    """
+
+    def __init__(self, server: LlamaServer) -> None:
+        load_kwargs: dict = {}
+        if HF_TOKEN:
+            load_kwargs["token"] = HF_TOKEN
+        load_chat_template(self, load_kwargs)
+        self.server = server
+        self.quantized = False  # not bitsandbytes 4-bit; the GGUF type is in .dtype
+        self.dtype = f"llama.cpp {Path(server.model_path).name}"
+        self.last_hit_budget = False
+        self.last_timings: dict = {}
+        self._lock = threading.Lock()
+        server.wait_ready()
+        self._check_vocabulary()
+
+    def _post(self, path: str, payload: dict) -> dict:
+        import urllib.request
+
+        request = urllib.request.Request(
+            self.server.url + path, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _check_vocabulary(self) -> None:
+        """Fails fast if the GGUF does not share the official tokenizer's vocabulary.
+
+        Prompt ids from a different tokenizer would still yield fluent-looking
+        but meaningless output, so the server must decode our ids back exactly.
+        """
+        probe = "صباح الخير. Guten Morgen."
+        ids = list(self.tokenizer(probe, add_special_tokens=False)["input_ids"])
+        decoded = self._post("/detokenize", {"tokens": ids}).get("content", "")
+        if decoded.strip() != probe:
+            raise RuntimeError(
+                f"The GGUF {Path(self.server.model_path).name} does not match the tokenizer of "
+                f"{TRANSLATION_MODEL}: ids {ids[:8]} decode to {decoded[:60]!r}. Use a GGUF of "
+                "the same model (LLAMA_GGUF_REPO/LLAMA_GGUF_FILE)."
+            )
+
+    def stream(self, text: str, context: list[tuple[str, str]], emit) -> None:
+        import urllib.error
+        import urllib.request
+
+        with self._lock:
+            prompt = [int(token) for token in chat_inputs(self, text, context)["input_ids"][0].tolist()]
+            source_tokens = len(self.tokenizer(text)["input_ids"])
+            budget = translation_budget(source_tokens)
+            payload = {
+                "prompt": prompt, "n_predict": budget, "stream": True,
+                "temperature": 0.0, "repeat_penalty": 1.05, "cache_prompt": True,
+            }
+            request = urllib.request.Request(
+                self.server.url + "/completion", data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            final: dict = {}
+            try:
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    for raw in response:
+                        line = raw.decode("utf-8").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        event = json.loads(data)
+                        if "error" in event:
+                            raise RuntimeError(f"llama-server error: {event['error']}")
+                        if event.get("content"):
+                            emit(event["content"])
+                        if event.get("stop"):
+                            final = event
+                            break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:500]
+                raise RuntimeError(f"llama-server returned HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, ConnectionError) as exc:
+                raise RuntimeError(f"llama-server is not reachable ({exc}). Last log lines:\n"
+                                   f"{self.server.log_tail()}") from exc
+            if not final:
+                raise RuntimeError("llama-server ended the stream without a final event. Last log "
+                                   f"lines:\n{self.server.log_tail()}")
+            self.last_timings = final.get("timings") or {}
+            stop_type = final.get("stop_type")
+            self.last_hit_budget = (stop_type == "limit" if stop_type
+                                    else final.get("tokens_predicted", 0) >= budget)
+            if self.last_hit_budget:
+                logger.warning(
+                    "Translation hit its %d-token budget for a %d-token source - the output is "
+                    "cut off. Raise TRANSLATION_TOKEN_RATIO or MAX_GEN_TOKENS.",
+                    budget, source_tokens,
+                )
+            if self.last_timings:
+                logger.debug("llama.cpp: prompt %d tok in %.0f ms, %d tok at %.1f tok/s",
+                             self.last_timings.get("prompt_n", 0), self.last_timings.get("prompt_ms", 0),
+                             self.last_timings.get("predicted_n", 0),
+                             self.last_timings.get("predicted_per_second", 0))
+
+    def translate(self, text: str, context: list[tuple[str, str]] = ()) -> str:
+        parts: list[str] = []
+        self.stream(text, list(context), parts.append)
+        return "".join(parts).strip()
+
+
 # Strong clause boundaries (sentence end, colon, semicolon, newline) and the
 # weak ones used only when a chunk would otherwise grow too long.
 _STRONG_BREAK = re.compile(r"[.!?؟…:;\n]")
@@ -903,14 +1330,18 @@ def split_speakable(buffer: str, index: int, flush: bool) -> tuple[str, str]:
     exists instead of waiting for the longest one that still fits. The target
     length only decides when to start looking: a complete sentence that falls
     somewhat short of it is still a better chunk than a padded one.
+
+    TTS_MAX_CHUNK_CHARS bounds the result even when flushing - a translation
+    without sentence punctuation would otherwise reach the TTS in one piece,
+    and a single call then has to synthesise half a minute of audio.
     """
     text = buffer.lstrip()
     if not text:
         return "", ""
-    if flush:
+    if flush and len(text) <= TTS_MAX_CHUNK_CHARS:
         return text, ""
     target = speakable_target(index)
-    if len(text) < target:
+    if not flush and len(text) < target:
         return "", buffer
     # The TTS needs a few words of context to sound natural, so never cut below
     # this even when a sentence ends very early.
@@ -923,8 +1354,24 @@ def split_speakable(buffer: str, index: int, flush: bool) -> tuple[str, str]:
         if not cut:
             cut = window.rfind(" ")
     if cut <= 0:
-        return "", buffer
+        return (text, "") if flush else ("", buffer)
     return text[:cut].strip(), text[cut:]
+
+
+def final_chunks(buffer: str, index: int) -> list[str]:
+    """Bounded chunks for the tail of a translation, in order."""
+    chunks: list[str] = []
+    while buffer.strip():
+        chunk, buffer = split_speakable(buffer, index + len(chunks), flush=True)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return chunks
+
+
+def is_speakable(text: str) -> bool:
+    """Phonon rejects input without a single pronounceable character."""
+    return any(character.isalnum() for character in text)
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +1387,43 @@ def _resample(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarr
     source_t = np.linspace(0.0, duration, num=audio.size, endpoint=False, dtype=np.float64)
     target_t = np.linspace(0.0, duration, num=target_len, endpoint=False, dtype=np.float64)
     return np.interp(target_t, source_t, audio).astype(np.float32)
+
+
+# WSOLA frames: 25 ms of audio spliced within a 5 ms search window. The search
+# is what keeps the pitch periods aligned across a splice, which is the whole
+# difference between "a faster speaker" and the phasing of plain overlap-add.
+_STRETCH_WINDOW = AUDIO_SAMPLE_RATE // 40
+_STRETCH_SEARCH = AUDIO_SAMPLE_RATE // 200
+
+
+def time_stretch(audio: np.ndarray, speed: float) -> np.ndarray:
+    """Plays `audio` `speed` times faster without shifting its pitch (WSOLA)."""
+    window, search = _STRETCH_WINDOW, _STRETCH_SEARCH
+    hop_out = window // 2
+    hop_in = int(round(hop_out * speed))
+    if speed <= 1.001 or hop_in <= hop_out or audio.size < window + hop_in + search:
+        return audio
+    taper = np.hanning(window + 2)[1:-1].astype(np.float32)
+    frames = int(np.ceil((audio.size - window) / hop_in)) + 1
+    out = np.zeros((frames - 1) * hop_out + window, dtype=np.float32)
+    weight = np.zeros_like(out)
+    start = 0
+    for index in range(frames):
+        frame = audio[start:start + window]
+        at = index * hop_out
+        out[at:at + frame.size] += frame * taper[:frame.size]
+        weight[at:at + frame.size] += taper[:frame.size]
+        # The next frame has to continue this one, so take the segment near the
+        # nominal read position that matches that continuation best.
+        reference = audio[start + hop_out:start + hop_out + window]
+        low = max(0, start + hop_in - search)
+        high = min(audio.size - window, start + hop_in + search)
+        if high <= low or reference.size < window:
+            start += hop_in
+            continue
+        candidates = np.lib.stride_tricks.sliding_window_view(audio[low:high + window], window)
+        start = low + int(np.argmax(candidates @ reference))
+    return np.divide(out, weight, out=np.zeros_like(out), where=weight > 1e-3)
 
 
 class XttsSynthesizer:
@@ -996,8 +1480,16 @@ class PhononSynthesizer:
             return self.tts
         import ptts
 
-        logger.info("Loading Phonon %s (lang %s, voice %s) on the CPU ...",
-                    PHONON_MODEL, TRANSLATION_TARGET_LANG, PHONON_VOICE or "model default")
+        if PHONON_THREADS:
+            set_threads = getattr(ptts, "set_num_threads", None)
+            if set_threads is None:
+                logger.warning("This ptts version has no set_num_threads(); PHONON_THREADS is ignored.")
+            else:
+                # Sizes Phonon's global thread pool, so it must run before the model loads.
+                set_threads(PHONON_THREADS)
+        logger.info("Loading Phonon %s (lang %s, voice %s) on the CPU (%s threads) ...",
+                    PHONON_MODEL, TRANSLATION_TARGET_LANG, PHONON_VOICE or "model default",
+                    PHONON_THREADS or "default")
         try:
             self.tts = ptts.TTS(PHONON_MODEL, lang=TRANSLATION_TARGET_LANG)
         except Exception as exc:  # noqa: BLE001 - wrapped with actionable guidance
@@ -1066,6 +1558,7 @@ class Turn:
     audio_seconds: float = 0.0
     first_audio_at: float | None = None
     chunks: int = 0
+    played_speed: float = 1.0
 
 
 @dataclass
@@ -1111,6 +1604,7 @@ class Pipeline:
         )
         self._interim_sizes: dict[str, int] = {}
         self._playout_backlog = 0.0
+        self._backlog_warned = 0.0
         self._playing_turn: str | None = None
         self._background: set[asyncio.Task] = set()
 
@@ -1223,7 +1717,7 @@ class Pipeline:
     async def _translate(self, turn: Turn) -> None:
         loop = asyncio.get_running_loop()
         pieces: asyncio.Queue[str | None] = asyncio.Queue()
-        context = list(self.translation_context) if TRANSLATION_CONTEXT_TURNS and TRANSLATION_BACKEND == "qwen" else []
+        context = list(self.translation_context) if TRANSLATION_CONTEXT_TURNS else []
         started = time.monotonic()
         failure: list[BaseException] = []
 
@@ -1286,15 +1780,17 @@ class Pipeline:
         await self._send(
             turn.identity, "translation", turn.utterance_id, turn.translation, TRANSLATION_TOPIC
         )
-        if turn.translation and TRANSLATION_CONTEXT_TURNS and TRANSLATION_BACKEND == "qwen":
+        if turn.translation and TRANSLATION_CONTEXT_TURNS:
             self.translation_context.append((turn.source_text, turn.translation))
 
         if not turn.wants_audio or not turn.translation:
             self._log_turn(turn)
             return
         rest = buffer.strip() if STREAM_TTS else turn.translation
-        if rest:
-            self.tts_queue.put_nowait((turn, rest, True))
+        tail = final_chunks(rest, chunk_index)
+        if tail:
+            for position, chunk in enumerate(tail):
+                self.tts_queue.put_nowait((turn, chunk, position == len(tail) - 1))
         elif STREAM_TTS and spoken:
             self.tts_queue.put_nowait((turn, "", True))
         else:
@@ -1307,7 +1803,7 @@ class Pipeline:
             turn, text, last = await self.tts_queue.get()
             samples = np.zeros(0, dtype=np.float32)
             try:
-                if text:
+                if is_speakable(text):
                     started = time.monotonic()
                     samples = await self.tts_gpu.run(PRIO_SPEECH, self.speech.synthesize, text)
                     turn.tts_ms += (time.monotonic() - started) * 1000
@@ -1334,11 +1830,12 @@ class Pipeline:
     def _drop_backlog(self) -> None:
         """Drops whole queued turns so the agent can catch up.
 
-        Only reachable when synthesis is persistently slower than the incoming
-        speech; without it the spoken output drifts behind forever. Dropping
-        happens per turn, never per chunk: losing one complete sentence is
-        recoverable, a sentence cut in half mid-word is not. The turn currently
-        being spoken and the newest turn are always kept.
+        The last resort: the faster playout above already absorbs a moderate
+        backlog without losing a word, so this only runs when synthesis is
+        persistently slower than the incoming speech even at MAX_PLAYOUT_SPEED.
+        Dropping happens per turn, never per chunk: losing one complete
+        sentence is recoverable, a sentence cut in half mid-word is not. The
+        turn currently being spoken and the newest turn are always kept.
         """
         target = MAX_AUDIO_BACKLOG_SECONDS / 2
         pending: list[AudioChunk] = []
@@ -1372,17 +1869,35 @@ class Pipeline:
 
         if dropped_turns:
             logger.warning(
-                "Speech output was %.1f s behind; skipped %d whole turn(s) (%.1f s): %s. "
-                "Synthesis is slower than real time; shorten MAX_UTTERANCE_SECONDS if this repeats.",
-                self._playout_backlog, len(dropped_turns), dropped_seconds, ", ".join(dropped_turns),
+                "Speech output was %.1f s behind even at %.2fx playout; skipped %d whole turn(s) "
+                "(%.1f s): %s. Synthesis is slower than real time; shorten "
+                "MAX_UTTERANCE_SECONDS or raise MAX_PLAYOUT_SPEED if this repeats.",
+                self._playout_backlog, MAX_PLAYOUT_SPEED, len(dropped_turns), dropped_seconds,
+                ", ".join(dropped_turns),
             )
             self._playout_backlog -= dropped_seconds
         elif self._playout_backlog > MAX_AUDIO_BACKLOG_SECONDS:
-            logger.warning(
-                "Speech output is %.1f s behind but nothing can be skipped without cutting a "
-                "sentence in half; the lag will persist until the speaker pauses.",
-                self._playout_backlog,
-            )
+            # Every enqueue re-checks the backlog, so warn only once per level.
+            if self._playout_backlog > self._backlog_warned + 2.0:
+                self._backlog_warned = self._playout_backlog
+                logger.warning(
+                    "Speech output is %.1f s behind but nothing can be skipped without cutting a "
+                    "sentence in half; the lag will persist until the speaker pauses.",
+                    self._playout_backlog,
+                )
+
+    def _playout_speed(self) -> float:
+        """Playback tempo for the next chunk, derived from the current backlog.
+
+        1.0 while the agent keeps up, ramping to MAX_PLAYOUT_SPEED exactly
+        where chunks would otherwise have to be dropped, so content is only
+        ever lost after speaking faster has failed to close the gap.
+        """
+        if MAX_PLAYOUT_SPEED <= 1.0 or self._playout_backlog <= SPEEDUP_BACKLOG_SECONDS:
+            return 1.0
+        span = max(MAX_AUDIO_BACKLOG_SECONDS - SPEEDUP_BACKLOG_SECONDS, 1e-6)
+        share = min(1.0, (self._playout_backlog - SPEEDUP_BACKLOG_SECONDS) / span)
+        return 1.0 + share * (MAX_PLAYOUT_SPEED - 1.0)
 
     async def run_playout(self) -> None:
         """Pushes synthesised audio to LiveKit in real time.
@@ -1394,17 +1909,24 @@ class Pipeline:
             chunk = await self.playout_queue.get()
             try:
                 self._playing_turn = chunk.turn.utterance_id
+                speed = self._playout_speed()
                 if chunk.samples.size:
                     if chunk.turn.first_audio_at is None:
                         chunk.turn.first_audio_at = time.monotonic()
-                    await self._stream_samples(chunk.samples)
+                    samples = chunk.samples
+                    if speed > 1.0:
+                        chunk.turn.played_speed = max(chunk.turn.played_speed, speed)
+                        samples = await asyncio.to_thread(time_stretch, chunk.samples, speed)
+                    await self._stream_samples(samples)
                     self._playout_backlog = max(
                         0.0, self._playout_backlog - chunk.samples.size / AUDIO_SAMPLE_RATE
                     )
+                    if self._playout_backlog <= SPEEDUP_BACKLOG_SECONDS:
+                        self._backlog_warned = 0.0
                 if chunk.last:
                     if chunk.tail_gap > 0:
                         await self._stream_samples(
-                            np.zeros(int(chunk.tail_gap * AUDIO_SAMPLE_RATE), dtype=np.float32)
+                            np.zeros(int(chunk.tail_gap / speed * AUDIO_SAMPLE_RATE), dtype=np.float32)
                         )
                     self._playing_turn = None
                     self._log_turn(chunk.turn)
@@ -1439,16 +1961,28 @@ class Pipeline:
         ]
         if turn.chunks:
             rtf = (turn.tts_ms / 1000) / max(turn.audio_seconds, 1e-6)
+            expansion = turn.audio_seconds / speech if speech else 0.0
             parts.append(
                 f"tts {turn.tts_ms:.0f}ms in {turn.chunks} chunk(s) "
-                f"-> {turn.audio_seconds:.1f}s audio (rtf {rtf:.2f})"
+                f"-> {turn.audio_seconds:.1f}s audio (rtf {rtf:.2f}, {expansion:.2f}x speech)"
             )
         if turn.first_audio_at is not None:
             parts.append(f"first audio {turn.first_audio_at - turn.captured_at:.2f}s after speech end")
         else:
             parts.append(f"text ready {time.monotonic() - turn.captured_at:.2f}s after speech end")
+        if turn.played_speed > 1.02:
+            parts.append(f"played {turn.played_speed:.2f}x to catch up")
         parts.append(f"backlog {self._playout_backlog:.1f}s")
         logger.info(" | ".join(parts))
+        if speech and turn.audio_seconds > OUTPUT_EXPANSION_WARNING * speech:
+            # Compute speed cannot fix this: more German audio than Arabic
+            # speech means the agent loses ground on every continuous minute.
+            logger.warning(
+                "Turn %s produced %.1fs of German for %.1fs of Arabic (%.1fx). Sustained above "
+                "1.0x no GPU is fast enough to keep up. Source %r -> translation %r",
+                turn.utterance_id, turn.audio_seconds, speech, turn.audio_seconds / speech,
+                turn.source_text[:200], turn.translation[:400],
+            )
 
     # -- LiveKit plumbing ---------------------------------------------------
 
@@ -1552,6 +2086,20 @@ def run_smoke_test(asr: AsrEngine, translator: Translator, speech: SpeechSynthes
     translated = "".join(pieces).strip()
     if not translated:
         raise RuntimeError("Smoke-test translation returned no text.")
+    # The rolling context is a prompt path of its own, and the live agent only
+    # reaches it from the second turn on. This is the only check that runs
+    # against the real model, so it has to cover that path too.
+    context_translated = ""
+    if TRANSLATION_CONTEXT_TURNS:
+        context_translated = translator.translate(source, [(source, translated)])
+        if not context_translated.strip():
+            raise RuntimeError("Smoke-test translation with rolling context returned no text.")
+        if TRANSLATION_BACKEND == "translategemma" and not _gemma_context_supported:
+            raise RuntimeError(
+                "TranslateGemma's chat template rejected the rolling context "
+                f"({_gemma_context_error}), so every turn would be translated without any "
+                "discourse. Set TRANSLATION_CONTEXT_TURNS=0 to accept that deliberately."
+            )
     buffer = translated
     chunks: list[np.ndarray] = []
     chunk_times: list[float] = []
@@ -1572,16 +2120,24 @@ def run_smoke_test(asr: AsrEngine, translator: Translator, speech: SpeechSynthes
     metrics = {
         "translation_model": TRANSLATION_MODEL,
         "translation_backend": TRANSLATION_BACKEND,
+        "translation_engine": TRANSLATION_ENGINE,
         "translation_4bit": translator.quantized,
         "translation_dtype": str(getattr(translator, "dtype", None)),
         "tts_model": PHONON_MODEL if TTS_BACKEND == "phonon" else XTTS_MODEL_NAME,
         "source_text": source,
         "german_text": translated,
+        "translation_context_turns": TRANSLATION_CONTEXT_TURNS,
+        "german_text_with_context": context_translated,
         "asr_tested_on_supplied_audio": bool(audio_path),
         "input_audio_seconds": input_seconds,
         "asr_seconds": asr_seconds,
         "translation_seconds": translation_seconds,
         "first_token_seconds": first_token_seconds,
+        "translation_tokens_per_second": (getattr(translator, "last_timings", None) or {}).get(
+            "predicted_per_second"),
+        # < 1 means the translator is faster than the speech; aim well below
+        # 0.5 so it keeps up with continuous speech and catches up after bursts.
+        "translation_to_speech_ratio": translation_seconds / input_seconds if input_seconds else None,
         "tts_seconds": sum(chunk_times),
         "tts_chunk_seconds": chunk_times,
         "output_audio_seconds": audio_seconds,
@@ -1590,6 +2146,10 @@ def run_smoke_test(asr: AsrEngine, translator: Translator, speech: SpeechSynthes
     }
     if torch.cuda.is_available():
         used = {pick_device_dtype(device)[1] for device in (ASR_DEVICE, TRANSLATION_DEVICE, TTS_DEVICE)}
+        if TRANSLATION_ENGINE == "llamacpp":
+            # llama.cpp's VRAM lives in another process; querying PyTorch here
+            # would only create an extra context on that GPU.
+            used.discard(pick_device_dtype(TRANSLATION_DEVICE)[1])
         metrics["gpu_peak_allocated_gib"] = {
             device: torch.cuda.max_memory_allocated(int(device.split(":")[1])) / 2**30
             for device in sorted(used) if device != "cpu"
@@ -1597,8 +2157,10 @@ def run_smoke_test(asr: AsrEngine, translator: Translator, speech: SpeechSynthes
     (destination / "metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
     )
-    logger.info("Smoke test saved to %s | MT %.2fs | TTS RTF %.2f (must be <1 to keep up).",
-                destination, translation_seconds, metrics["tts_rtf"])
+    tokens_per_second = metrics["translation_tokens_per_second"]
+    logger.info("Smoke test saved to %s | MT %.2fs%s | TTS RTF %.2f (must be <1 to keep up).",
+                destination, translation_seconds,
+                f" ({tokens_per_second:.1f} tok/s)" if tokens_per_second else "", metrics["tts_rtf"])
     if not audio_path:
         logger.warning("Smoke test used Arabic text, not microphone audio; ASR accuracy was NOT tested.")
     if metrics["tts_rtf"] >= 1:
@@ -1609,14 +2171,21 @@ def prepare_models() -> tuple[AsrEngine, Translator, SpeechSynthesizer]:
     dtype, device = pick_device_dtype(ASR_DEVICE)
     default_translation_dtype, translation_device = pick_device_dtype(TRANSLATION_DEVICE)
     _, tts_device = pick_device_dtype(TTS_DEVICE)
-    logger.info("Placement: ASR=%s | translation=%s | TTS=%s",
-                device, translation_device, tts_device)
+    logger.info("Placement: ASR=%s | translation=%s (%s) | TTS=%s",
+                device, translation_device, TRANSLATION_ENGINE, tts_device)
+    if TORCH_CPU_THREADS:
+        torch.set_num_threads(TORCH_CPU_THREADS)
     if TRANSLATION_BACKEND == "translategemma":
         logger.info(
-            "TranslateGemma uses its official %s->%s template; "
-            "Qwen system prompt and rolling context are not used.",
-            TRANSLATION_SOURCE_LANG, TRANSLATION_TARGET_LANG,
+            "TranslateGemma uses its official %s->%s template; the Qwen system prompt is not "
+            "used, and the rolling context travels as earlier user/assistant turns (%d).",
+            TRANSLATION_SOURCE_LANG, TRANSLATION_TARGET_LANG, TRANSLATION_CONTEXT_TURNS,
         )
+    server = None
+    if TRANSLATION_ENGINE == "llamacpp":
+        # Loads the GGUF in its own process while the ASR and TTS load below.
+        server = LlamaServer(translation_device)
+        server.start()
     rng = np.random.default_rng(0)
     warmup_audio = (rng.standard_normal(SAMPLE_RATE) * 0.01).astype(np.float32)
 
@@ -1637,10 +2206,14 @@ def prepare_models() -> tuple[AsrEngine, Translator, SpeechSynthesizer]:
         raise RuntimeError("TTS warm-up produced empty or non-finite audio; startup aborted.")
     _vram_report("TTS", tts_device)
 
-    compute_dtype = translation_dtype(default_translation_dtype, translation_device)
-    logger.info("Loading translator %s (%s, %s compute)", TRANSLATION_MODEL,
-                "4-bit" if TRANSLATION_4BIT else "full precision", compute_dtype)
-    translator = Translator(compute_dtype, translation_device)
+    if server is not None:
+        logger.info("Waiting for llama-server (%s) ...", Path(server.model_path).name)
+        translator = LlamaCppTranslator(server)
+    else:
+        compute_dtype = translation_dtype(default_translation_dtype, translation_device)
+        logger.info("Loading translator %s (%s, %s compute)", TRANSLATION_MODEL,
+                    "4-bit" if TRANSLATION_4BIT else "full precision", compute_dtype)
+        translator = Translator(compute_dtype, translation_device)
     if not translator.translate("صباح الخير.").strip():
         if getattr(translator, "last_hit_budget", False):
             raise RuntimeError(
@@ -1649,9 +2222,12 @@ def prepare_models() -> tuple[AsrEngine, Translator, SpeechSynthesizer]:
                 "sign of NaN logits from numeric overflow; set TRANSLATION_DTYPE=float32."
             )
         raise RuntimeError("Translator warm-up produced an empty translation; startup aborted.")
-    logger.info("Translator ready: %s, %s compute", "4-bit" if translator.quantized else "full precision",
+    logger.info("Translator ready: %s, %s", "4-bit" if translator.quantized else "not 4-bit",
                 getattr(translator, "dtype", "?"))
-    _vram_report("translator", translation_device)
+    if server is not None:
+        _gpu_memory_report("translator", translation_device)
+    else:
+        _vram_report("translator", translation_device)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1750,8 +2326,9 @@ async def main(smoke_dir: str | None = None, test_audio: str | None = None) -> N
     # asyncio.to_thread shares one executor; Colab's 2 vCPUs would otherwise
     # cap it at six threads for ASR, translation, TTS and the VAD handoff.
     asyncio.get_running_loop().set_default_executor(
-        ThreadPoolExecutor(max_workers=8, thread_name_prefix="model")
+        ThreadPoolExecutor(max_workers=8, thread_name_prefix="model", initializer=pin_cuda_device)
     )
+    pin_cuda_device()
     url = os.environ.get("LIVEKIT_URL", "").strip()
     key = os.environ.get("LIVEKIT_API_KEY", "").strip()
     secret = os.environ.get("LIVEKIT_API_SECRET", "").strip()
@@ -1771,7 +2348,9 @@ async def main(smoke_dir: str | None = None, test_audio: str | None = None) -> N
             props = torch.cuda.get_device_properties(index)
             logger.info("GPU %d: %s (%.1f GiB)", index, props.name, props.total_memory / 2**30)
     logger.info("ASR model: %s", COHERE_MODEL_NAME)
-    logger.info("Translation model: %s (%s)", TRANSLATION_MODEL, "4-bit" if TRANSLATION_4BIT else "fp16/bf16")
+    logger.info("Translation model: %s (%s)", TRANSLATION_MODEL,
+                f"llama.cpp, {LLAMA_GGUF_FILE}" if TRANSLATION_ENGINE == "llamacpp"
+                else "4-bit" if TRANSLATION_4BIT else "fp16/bf16")
     if TTS_BACKEND == "phonon":
         logger.info("TTS backend: phonon (%s, voice: %s, CPU; CC BY-NC 4.0 for 40m models)",
                     PHONON_MODEL, PHONON_VOICE or "model default")
@@ -1783,6 +2362,9 @@ async def main(smoke_dir: str | None = None, test_audio: str | None = None) -> N
         "on" if STREAM_TTS else "off",
         "on" if INTERIM_CAPTIONS else "off",
     )
+    logger.info("Catch-up: playout up to %.2fx from %.1f s backlog, turns dropped only beyond %.1f s",
+                MAX_PLAYOUT_SPEED, SPEEDUP_BACKLOG_SECONDS, MAX_AUDIO_BACKLOG_SECONDS)
+    logger.info("Translation context: %d previous turn(s)", TRANSLATION_CONTEXT_TURNS)
     logger.info("Max utterance length: %.2f s", MAX_UTTERANCE_SECONDS)
     logger.info("End-of-speech silence: %.2f s", END_SILENCE_SECONDS)
     logger.info("Max generated tokens per pass: %d", MAX_GEN_TOKENS)
@@ -1813,6 +2395,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.test_audio and args.smoke_test is None:
         parser.error("--test-audio requires --smoke-test OUTPUT_DIR")
+
+    def stop_on_sigterm(signum, _frame) -> None:
+        # The notebook stops the agent with SIGTERM: stop llama-server first so
+        # its VRAM is freed even if a model call delays the interpreter exit.
+        for server in list(LlamaServer.running):
+            server.stop()
+        raise SystemExit(128 + signum)
+
+    import signal
+
+    signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
         asyncio.run(main(args.smoke_test, args.test_audio))
     except KeyboardInterrupt:

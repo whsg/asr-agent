@@ -29,33 +29,64 @@ def dual_gpu(bot, monkeypatch):
     monkeypatch.setattr(bot, "GPU_CONCURRENCY", 1)
 
 
-def run_kaggle_install_cell(tmp_path, *, urlopen=None, pip_output="ok\n", pip_code=0, commands=None, envs=None):
+def run_kaggle_install_cell(tmp_path, *, urlopen=None, pip_output="ok\n", pip_code=0, commands=None, envs=None,
+                            has_nvcc=True, build_llama=True, streamed=None, printed=None):
     commands = [] if commands is None else commands
     envs = {} if envs is None else envs
+    streamed = [] if streamed is None else streamed
+    printed = [] if printed is None else printed
+
+    def finish(command):
+        if command[:2] == ["cmake", "--build"]:
+            server = tmp_path / "llama.cpp" / "build" / "bin" / "llama-server"
+            server.parent.mkdir(parents=True, exist_ok=True)
+            server.write_text("binary")
 
     def run(command, **kwargs):
         commands.append(command)
         envs[id(command)] = kwargs.get("env") or {}
         is_pip = command[1:3] == ["-m", "pip"]
         kwargs["stdout"].write(pip_output if is_pip else "ok\n")
+        finish(command)
         return SimpleNamespace(returncode=pip_code if is_pip else 0)
+
+    class FakePopen:
+        """The streaming variant: output is consumed line by line, not redirected."""
+
+        def __init__(self, command, **kwargs):
+            commands.append(command)
+            streamed.append(command)
+            envs[id(command)] = kwargs.get("env") or {}
+            finish(command)
+            self.stdout = iter(["[  7%] Building CUDA object ggml-cuda/mmq.cu.o\n", "ok\n"])
+
+        def wait(self):
+            return 0
 
     versions = {"torch": "2.6.0+cu124", "torchaudio": "2.6.0+cu124", "torchvision": "0.21.0+cu124"}
     tree = ast.parse("".join(kaggle_cells()[1]["source"]))
     tree.body = [node for node in tree.body
                  if not isinstance(node, (ast.Import, ast.ImportFrom))
                  and not (isinstance(node, ast.Assign) and any(
-                     isinstance(t, ast.Name) and t.id == "WORK" for t in node.targets))
+                     isinstance(t, ast.Name) and t.id in ("WORK", "LLAMA_DIR", "BUILD_LLAMA_CPP")
+                     for t in node.targets))
                  and not isinstance(node, ast.If)]
     namespace = {
-        "WORK": tmp_path, "os": SimpleNamespace(environ={}), "print": lambda *a, **k: None,
-        "sys": SimpleNamespace(executable="python"),
-        "subprocess": SimpleNamespace(run=run, STDOUT=-2),
+        "WORK": tmp_path, "os": SimpleNamespace(environ={}, cpu_count=lambda: 4),
+        "print": lambda *a, **k: printed.append(" ".join(str(part) for part in a)),
+        "sys": SimpleNamespace(executable="python"), "Path": Path,
+        "time": SimpleNamespace(monotonic=lambda: 1e6),
+        "LLAMA_DIR": tmp_path / "llama.cpp", "BUILD_LLAMA_CPP": build_llama,
+        "shutil": SimpleNamespace(which=lambda name: str(nvcc) if has_nvcc else None,
+                                  rmtree=lambda *a, **k: None),
+        "subprocess": SimpleNamespace(run=run, Popen=FakePopen, STDOUT=-2, PIPE=-1),
         "metadata": SimpleNamespace(version=versions.__getitem__, PackageNotFoundError=KeyError),
         "urllib": SimpleNamespace(request=SimpleNamespace(
             urlopen=urlopen or (lambda *a, **k: SimpleNamespace(close=lambda: None)))),
     }
     (tmp_path / "gpu-preflight.log").write_text("ok\n")
+    nvcc = tmp_path / "nvcc"
+    nvcc.write_text("")
     exec(compile(tree, "kaggle-install", "exec"), namespace)
     return commands, versions
 
@@ -98,6 +129,87 @@ def test_kaggle_install_http_status_counts_as_online(tmp_path):
     assert any(c[1:3] == ["-m", "pip"] for c in commands)
 
 
+def test_kaggle_install_builds_llama_server_for_t4_only(tmp_path):
+    commands, _ = run_kaggle_install_cell(tmp_path)
+    clone = next(c for c in commands if c[:2] == ["git", "clone"])
+    assert clone[clone.index("--branch") + 1] == "b12361", "pinned llama.cpp release"
+    configure = next(c for c in commands if c[0] == "cmake" and "-S" in c)
+    assert "-DGGML_CUDA=ON" in configure
+    assert "-DCMAKE_CUDA_ARCHITECTURES=75" in configure, "native T4 code, no driver JIT"
+    assert f"-DCMAKE_CUDA_COMPILER={tmp_path / 'nvcc'}" in configure
+    # Kaggle ships no libcuda.so link stub, so CMake never defines the
+    # CUDA::cuda_driver target llama.cpp links for its VMM pool.
+    assert "-DGGML_CUDA_NO_VMM=ON" in configure
+    assert "-DLLAMA_USE_PREBUILT_UI=OFF" in configure, "no web UI download during the build"
+    build = next(c for c in commands if c[:2] == ["cmake", "--build"])
+    assert build[build.index("--target") + 1] == "llama-server"
+    server = str(tmp_path / "llama.cpp" / "build" / "bin" / "llama-server")
+    assert [server, "--version"] in commands
+    assert server == kaggle_literal("PROFILE")["LLAMA_SERVER_BIN"].replace(
+        "/tmp/llama.cpp", str(tmp_path / "llama.cpp"))
+
+
+def test_kaggle_build_prints_progress_so_it_cannot_look_hung(tmp_path):
+    """Half an hour of silence is indistinguishable from a crashed build."""
+    streamed, printed = [], []
+    run_kaggle_install_cell(tmp_path, streamed=streamed, printed=printed)
+    assert [command[:2] for command in streamed] == [["cmake", "--build"]], \
+        "only the long compile needs live output"
+    assert any("20-40 minutes" in line for line in printed), "the wait must be announced"
+
+
+def test_kaggle_install_error_report_keeps_the_cause_under_the_error_line(tmp_path):
+    """CMake names the missing target *below* "CMake Error", so it must survive.
+
+    A filter that keeps only lines containing "error" turns the one message that
+    says what is wrong into a line number and nothing else.
+    """
+    log = (
+        "-- Configuring incomplete\n"
+        'CMake Error at ggml/src/ggml-cuda/CMakeLists.txt:181 (target_link_libraries):\n'
+        '  Target "ggml-cuda" links to:\n'
+        "\n"
+        "    CUDA::cuda_driver\n"
+        "\n"
+        "  but the target was not found.\n"
+    )
+    with pytest.raises(RuntimeError) as error:
+        run_kaggle_install_cell(tmp_path, pip_output=log, pip_code=1)
+    assert "CUDA::cuda_driver" in str(error.value)
+    assert "but the target was not found" in str(error.value)
+
+
+def test_kaggle_install_refuses_a_saved_version_run(tmp_path):
+    """"Save & Run All" has no microphone, so it can only burn GPU quota.
+
+    The guard is a module-level `if`, which run_kaggle_install_cell strips, so
+    this checks the source instead of executing it.
+    """
+    install = "".join(kaggle_cells()[1]["source"])
+    assert "KAGGLE_KERNEL_RUN_TYPE" in install
+    assert "Quick Save" in install
+    # The GPU check has to name every realistic cause, not just the setting.
+    assert "weekly GPU quota" in install and "Accelerator" in install
+
+
+def test_kaggle_install_reuses_build_and_can_skip_it(tmp_path):
+    first, _ = run_kaggle_install_cell(tmp_path)
+    assert any(c[:2] == ["cmake", "--build"] for c in first)
+    again, _ = run_kaggle_install_cell(tmp_path)
+    assert not any(c[0] in ("git", "cmake") for c in again), "same session: reuse the binary"
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    skipped, _ = run_kaggle_install_cell(fallback, build_llama=False)
+    assert not any(c[0] in ("git", "cmake") for c in skipped)
+
+
+def test_kaggle_install_without_nvcc_names_the_fallback(tmp_path):
+    if Path("/usr/local/cuda/bin/nvcc").exists():
+        pytest.skip("this machine has a real CUDA compiler")
+    with pytest.raises(RuntimeError, match="nvcc is missing(.|\n)*TRANSLATION_ENGINE"):
+        run_kaggle_install_cell(tmp_path, has_nvcc=False)
+
+
 def test_kaggle_install_failure_puts_cause_in_traceback(tmp_path):
     output = "Collecting x\nERROR: No matching distribution found for livekit>=1.0\n"
     with pytest.raises(RuntimeError) as error:
@@ -126,15 +238,27 @@ def kaggle_literal(name):
 
 def test_kaggle_profile_splits_gpus_and_runs_phonon_on_cpu():
     profile = kaggle_literal("PROFILE")
-    # ASR and translation on separate GPUs: separate queues, so they overlap.
+    # GPU 0 belongs to the 8-bit translator alone, GPU 1 to the ASR.
     assert profile["ASR_DEVICE"] == "cuda:1" and profile["TRANSLATION_DEVICE"] == "cuda:0"
     assert profile["TRANSLATION_MODEL"] == "google/translategemma-12b-it"
     assert profile["TRANSLATION_BACKEND"] == "translategemma"
-    assert profile["TRANSLATION_4BIT"] == "1"
-    assert profile["TRANSLATION_CONTEXT_TURNS"] == "0"
+    assert profile["TRANSLATION_ENGINE"] == "llamacpp"
+    assert profile["LLAMA_GGUF_REPO"] == "mradermacher/translategemma-12b-it-GGUF"
+    assert profile["LLAMA_GGUF_FILE"] == "translategemma-12b-it.Q8_0.gguf"
+    assert profile["LLAMA_THREADS"] == "1"
+    assert profile["TRANSLATION_4BIT"] == "1", "kept for the transformers fallback"
+    # Gemma now gets discourse context too, but only two turns: they share its
+    # 2048-token input window with the source and are re-prefilled every turn.
+    assert profile["TRANSLATION_CONTEXT_TURNS"] == "2"
+    # A backlog is absorbed by speaking faster before any turn is dropped. The
+    # measured expansion sits at ~1.0x, so there is no slack and the ramp has
+    # to start almost at once.
+    assert profile["MAX_PLAYOUT_SPEED"] == "1.35"
+    assert profile["SPEEDUP_BACKLOG_SECONDS"] == "1"
     assert profile["GPU_CONCURRENCY"] == "1"
     assert profile["TTS_BACKEND"] == "phonon" and profile["TTS_DEVICE"] == "cpu"
     assert profile["PHONON_MODEL"] == "hf://gradium/phonon-40m-de"
+    assert profile["PHONON_THREADS"] == "2" and profile["TORCH_CPU_THREADS"] == "1"
     install = "".join(kaggle_cells()[1]["source"])
     assert "'ptts'" in install and "import ptts" in install
     notebook = (ROOT / "kaggle_agent.ipynb").read_text().lower()
@@ -233,8 +357,13 @@ def test_translategemma_official_api_and_token_stream(bot, monkeypatch, prompt_l
             return self
 
     class Tokenizer:
-        def __call__(self, text):
-            return {"input_ids": [1, 2, 3]}
+        bos_token = "<bos>"
+
+        def __call__(self, text, **kwargs):
+            if kwargs.get("return_tensors") != "pt":
+                return {"input_ids": [1, 2, 3]}
+            calls["tokenizer_kwargs"] = kwargs
+            return Inputs(input_ids=SimpleNamespace(shape=(1, prompt_length)))
 
     class Processor:
         tokenizer = Tokenizer()
@@ -242,7 +371,7 @@ def test_translategemma_official_api_and_token_stream(bot, monkeypatch, prompt_l
         def apply_chat_template(self, messages, **kwargs):
             calls["messages"] = messages
             calls["template_kwargs"] = kwargs
-            return Inputs(input_ids=SimpleNamespace(shape=(1, prompt_length)))
+            return "<bos>rendered prompt"
 
     class Streamer:
         def __init__(self, tokenizer, **kwargs):
@@ -310,12 +439,20 @@ def test_translategemma_official_api_and_token_stream(bot, monkeypatch, prompt_l
     assert engine.dtype == bot.torch.bfloat16
     assert engine.last_hit_budget is False
     assert calls["inputs_device"] == "cuda:0"
-    assert calls["messages"] == [{
-        "role": "user", "content": [{
+    # The previous turn travels as a user/assistant pair, because the template
+    # has no system role: without it every VAD fragment loses its discourse.
+    # Its assistant role takes a plain string, not a content list.
+    assert calls["messages"] == [
+        {"role": "user", "content": [{
+            "type": "text", "source_lang_code": "ar", "target_lang_code": "de",
+            "text": "old source",
+        }]},
+        {"role": "assistant", "content": "old target"},
+        {"role": "user", "content": [{
             "type": "text", "source_lang_code": "ar", "target_lang_code": "de",
             "text": "صباح الخير",
-        }],
-    }]
+        }]},
+    ]
     assert "enable_thinking" not in calls["template_kwargs"]
     assert calls["generation"]["do_sample"] is False
     assert engine.quantized
@@ -387,6 +524,116 @@ def test_qwen_template_keeps_interleaved_context(bot):
     assert calls["kwargs"]["enable_thinking"] is False
 
 
+class GemmaTemplate:
+    """Enforces the two contracts the real stack imposes, which disagree.
+
+    Verified against google/translategemma-12b-it's chat_template.jinja and
+    transformers' ProcessorMixin.apply_chat_template:
+
+    - the template requires the assistant role to carry a plain string, a user
+      content list with exactly one item, and strictly alternating roles
+      starting with the user;
+    - the processor's `tokenize=True` path scans every message for images and
+      indexes each content entry, which a plain string cannot survive.
+
+    So only rendering text-only satisfies both.
+    """
+
+    def __init__(self, tokens_per_message: int = 100) -> None:
+        self.tokens_per_message = tokens_per_message
+        self.rendered: list[list[dict]] = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        if kwargs.get("tokenize", True):
+            for message in messages:
+                for content in message["content"]:
+                    content["type"]  # a string raises TypeError here, as in transformers
+        if messages[0]["role"] != "user":
+            raise ValueError("Conversations must start with a user prompt.")
+        for index, message in enumerate(messages):
+            if (message["role"] == "user") != (index % 2 == 0):
+                raise ValueError("Conversation roles must alternate user/assistant/...")
+            if message["role"] == "assistant":
+                if not isinstance(message["content"], str):
+                    raise ValueError("Assistant role must provide content as a string")
+            elif not isinstance(message["content"], list) or len(message["content"]) != 1:
+                raise ValueError("User role must provide `content` as an iterable with one item.")
+        self.rendered.append(messages)
+        return "<bos>" + "|".join(str(message["role"]) for message in messages)
+
+
+class GemmaTokenizer:
+    bos_token = "<bos>"
+
+    def __init__(self, template: GemmaTemplate) -> None:
+        self.template = template
+        self.calls: list[dict] = []
+
+    def __call__(self, text, **kwargs):
+        self.calls.append({"text": text, **kwargs})
+        length = self.template.tokens_per_message * (text.count("|") + 1)
+        return {"input_ids": SimpleNamespace(shape=(1, length))}
+
+
+def gemma_owner(bot, template=None):
+    template = template if template is not None else GemmaTemplate()
+    owner = bot.Translator.__new__(bot.Translator)
+    owner.backend = "translategemma"
+    owner.processor = template
+    owner.tokenizer = GemmaTokenizer(template)
+    return owner
+
+
+def test_gemma_prompt_is_rendered_text_only_then_tokenized(bot):
+    """The processor's tokenizing path cannot handle the template's own format.
+
+    It indexes every content entry looking for images; the template demands a
+    plain string on the assistant role. Rendering text-only is the only way to
+    satisfy both, and the template already emits the BOS token.
+    """
+    owner = gemma_owner(bot)
+    bot._gemma_inputs(owner, "now", [("src", "tgt")])
+
+    assert owner.processor.rendered, "the official template was not used"
+    assert owner.tokenizer.calls[-1]["add_special_tokens"] is False, "BOS would be doubled"
+    assert owner.tokenizer.calls[-1]["text"].startswith("<bos>")
+
+
+def test_gemma_context_is_trimmed_to_its_input_window(bot):
+    """Gemma's input is 2048 tokens; the oldest turn is the cheapest to lose."""
+    template = GemmaTemplate(tokens_per_message=500)
+    context = [("src1", "tgt1"), ("src2", "tgt2"), ("src3", "tgt3")]
+    bot._gemma_inputs(gemma_owner(bot, template), "now", context)
+
+    assert [len(attempt) for attempt in template.rendered] == [7, 5, 3], "oldest turns dropped first"
+    assert template.rendered[-1][0]["content"][0]["text"] == "src3", "the newest context survives"
+    assert template.rendered[-1][-1]["content"][0]["text"] == "now"
+
+
+def test_gemma_falls_back_to_context_free_if_the_template_refuses(bot, monkeypatch, caplog):
+    """A template that rejects earlier turns must not kill every translation."""
+    monkeypatch.setattr(bot, "_gemma_context_supported", True)
+    monkeypatch.setattr(bot, "_gemma_context_error", "")
+
+    class Refusing(GemmaTemplate):
+        def apply_chat_template(self, messages, **kwargs):
+            if len(messages) > 1:
+                raise ValueError("only a single user turn is supported")
+            return super().apply_chat_template(messages, **kwargs)
+
+    template = Refusing()
+    owner = gemma_owner(bot, template)
+    with caplog.at_level("WARNING", logger="asr-bot"):
+        bot._gemma_inputs(owner, "now", [("src", "tgt")])
+    # The cause has to travel with the warning; "see the log above" cost a run.
+    assert "only a single user turn is supported" in caplog.text
+    assert bot._gemma_context_error.endswith("only a single user turn is supported")
+    assert len(template.rendered[-1]) == 1
+    # The probe runs once, not on every turn.
+    bot._gemma_inputs(owner, "later", [("src", "tgt")])
+    assert [len(attempt) for attempt in template.rendered] == [1, 1]
+
+
 def test_pipeline_uses_separate_tts_admission(bot):
     from test_pipeline import FakeAsr, FakeTranslator, FakeSpeech, FakeRoom, RealtimeAudioSource
 
@@ -417,7 +664,8 @@ def test_smoke_test_saves_real_outputs_and_honest_metrics(bot, monkeypatch, tmp_
             path=path, audio=audio, rate=rate),
     ))
     translator = SimpleNamespace(
-        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."))
+        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."),
+        translate=lambda text, context=(): "Guten Morgen.")
     speech = SimpleNamespace(synthesize=lambda text: np.ones(24_000, dtype=np.float32))
     bot.run_smoke_test(None, translator, speech, str(tmp_path))
     metrics = json.loads((tmp_path / "metrics.json").read_text())
@@ -428,6 +676,44 @@ def test_smoke_test_saves_real_outputs_and_honest_metrics(bot, monkeypatch, tmp_
     assert metrics["asr_tested_on_supplied_audio"] is False
     assert metrics["asr_seconds"] is None
     assert "NOT live" in metrics["timing_scope"]
+
+
+def test_smoke_test_covers_the_rolling_context_prompt(bot, monkeypatch, tmp_path):
+    """The context is its own prompt path, and only the real model can judge it.
+
+    The live agent reaches it from the second turn on, so a smoke test that
+    only ever translates with an empty history cannot catch a template that
+    rejects earlier turns - which is exactly how that bug reached a live run.
+    """
+    monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace(
+        write=lambda *args, **kwargs: None))
+    contexts = []
+    translator = SimpleNamespace(
+        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."),
+        translate=lambda text, context=(): (contexts.append(list(context)), "Mit Kontext.")[1])
+    speech = SimpleNamespace(synthesize=lambda text: np.ones(24_000, dtype=np.float32))
+
+    bot.run_smoke_test(None, translator, speech, str(tmp_path))
+
+    assert contexts == [[("الحمد لله رب العالمين. نسأل الله أن يرزقنا العلم النافع والعمل الصالح.",
+                          "Guten Morgen.")]]
+    metrics = json.loads((tmp_path / "metrics.json").read_text())
+    assert metrics["german_text_with_context"] == "Mit Kontext."
+
+
+def test_smoke_test_fails_if_gemma_silently_dropped_the_context(bot, monkeypatch, tmp_path):
+    """Degrading quietly is right in a live room, but wrong in a pre-flight check."""
+    monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace(
+        write=lambda *args, **kwargs: None))
+    monkeypatch.setattr(bot, "TRANSLATION_BACKEND", "translategemma")
+    monkeypatch.setattr(bot, "_gemma_context_supported", False)
+    translator = SimpleNamespace(
+        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."),
+        translate=lambda text, context=(): "Ohne Kontext.")
+    speech = SimpleNamespace(synthesize=lambda text: np.ones(24_000, dtype=np.float32))
+
+    with pytest.raises(RuntimeError, match="rejected the rolling context"):
+        bot.run_smoke_test(None, translator, speech, str(tmp_path))
 
 
 @pytest.mark.parametrize("input_seconds, valid", [(1.0, True), (13.0, False)])
@@ -444,7 +730,8 @@ def test_smoke_test_uses_supplied_arabic_audio(bot, monkeypatch, tmp_path, input
 
     asr = SimpleNamespace(transcribe=transcribe)
     translator = SimpleNamespace(
-        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."))
+        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."),
+        translate=lambda text, context=(): "Guten Morgen.")
     speech = SimpleNamespace(synthesize=lambda text: np.ones(24_000, dtype=np.float32))
     if not valid:
         with pytest.raises(ValueError, match="between 0 and"):

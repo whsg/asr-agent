@@ -70,7 +70,8 @@
         <strong>Google Colab</strong>. The bot cuts the audio into sentences with a a
         Silero-VAD thread per speaker and transcribes every utterance with
         <strong>Cohere Transcribe Arabic</strong>. The Arabic text is translated to German by
-        <strong>Qwen3-4B-Instruct</strong> in fp16 (TranslateGemma 12B on Kaggle) and spoken by
+        <strong>Qwen3-4B-Instruct</strong> in fp16 (on Kaggle: TranslateGemma 12B in 8 bit via
+        llama.cpp, alone on one T4) and spoken by
         <strong>Gradium Phonon</strong> on the CPU (German model CC BY-NC 4.0: not for commercial
         use without an agreement with Gradium). Every stage is an independent worker, so the
         transcript, the translation and the speech stream back in near real time.
