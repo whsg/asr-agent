@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import queue
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -238,13 +239,14 @@ def kaggle_literal(name):
 
 def test_kaggle_profile_splits_gpus_and_runs_phonon_on_cpu():
     profile = kaggle_literal("PROFILE")
+    translator = kaggle_literal("TRANSLATORS")[kaggle_literal("TRANSLATOR")]
     # GPU 0 belongs to the 8-bit translator alone, GPU 1 to the ASR.
     assert profile["ASR_DEVICE"] == "cuda:1" and profile["TRANSLATION_DEVICE"] == "cuda:0"
-    assert profile["TRANSLATION_MODEL"] == "google/translategemma-12b-it"
-    assert profile["TRANSLATION_BACKEND"] == "translategemma"
+    assert translator["TRANSLATION_MODEL"] == "google/translategemma-12b-it"
+    assert translator["TRANSLATION_BACKEND"] == "translategemma"
     assert profile["TRANSLATION_ENGINE"] == "llamacpp"
-    assert profile["LLAMA_GGUF_REPO"] == "mradermacher/translategemma-12b-it-GGUF"
-    assert profile["LLAMA_GGUF_FILE"] == "translategemma-12b-it.Q8_0.gguf"
+    assert translator["LLAMA_GGUF_REPO"] == "mradermacher/translategemma-12b-it-GGUF"
+    assert translator["LLAMA_GGUF_FILE"] == "translategemma-12b-it.Q8_0.gguf"
     assert profile["LLAMA_THREADS"] == "1"
     assert profile["TRANSLATION_4BIT"] == "1", "kept for the transformers fallback"
     # Gemma now gets discourse context too, but only two turns: they share its
@@ -271,7 +273,10 @@ def test_kaggle_access_check_covers_all_gated_models():
     start = next(i for i, n in enumerate(tree.body) if isinstance(n, ast.Assign)
                  and any(getattr(t, "id", None) == "ACCESS_REPOS" for t in n.targets))
     calls = []
-    namespace = {"PROFILE": kaggle_literal("PROFILE"),
+    # The access check reads the merged profile, so the test has to merge too.
+    profile = kaggle_literal("PROFILE")
+    profile.update(kaggle_literal("TRANSLATORS")[kaggle_literal("TRANSLATOR")])
+    namespace = {"PROFILE": profile,
                  "run_logged": lambda arguments, log_name, **kwargs: calls.append(arguments)}
     for node in tree.body[start:]:
         exec(compile(ast.Module(body=[node], type_ignores=[]), "access", "exec"), namespace)
@@ -597,6 +602,83 @@ def test_gemma_prompt_is_rendered_text_only_then_tokenized(bot):
     assert owner.processor.rendered, "the official template was not used"
     assert owner.tokenizer.calls[-1]["add_special_tokens"] is False, "BOS would be doubled"
     assert owner.tokenizer.calls[-1]["text"].startswith("<bos>")
+
+
+def test_gemma_seed_examples_lead_every_request_and_survive_trimming(bot, monkeypatch):
+    """The only way to set register and terminology for TranslateGemma.
+
+    Its template hardcodes its instruction and has no system role, so a prompt
+    cannot reach it - only a worked example can. That makes the examples more
+    valuable than the rolling turns, so trimming must never touch them.
+    """
+    monkeypatch.setattr(bot, "SEED_CONTEXT", [("الحمد لله", "Alles Lob gebührt Allah")])
+    template = GemmaTemplate(tokens_per_message=500)
+    bot._gemma_inputs(gemma_owner(bot, template), "now", [("src1", "tgt1"), ("src2", "tgt2")])
+
+    first, last = template.rendered[0], template.rendered[-1]
+    assert first[0]["content"][0]["text"] == "الحمد لله", "the example must lead"
+    assert first[1]["content"] == "Alles Lob gebührt Allah"
+    # Trimmed down to the examples plus the current turn, never below.
+    assert [len(attempt) for attempt in template.rendered] == [7, 5, 3]
+    assert last[0]["content"][0]["text"] == "الحمد لله"
+    assert last[-1]["content"][0]["text"] == "now"
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Lob sei Gott, dem Herrn der Welten.", "Lob sei Allah, dem Herrn der Welten."),
+    ("Das Haus Gottes", "Das Haus Allahs"),
+    # Whole words only: a compound keeps its own meaning.
+    ("Der Gottesdienst beginnt.", "Der Gottesdienst beginnt."),
+    ("gottesfürchtig", "gottesfürchtig"),
+])
+def test_glossary_rewrites_whole_words_only(bot, monkeypatch, text, expected):
+    monkeypatch.setattr(bot, "GLOSSARY", {"Gott": "Allah", "Gottes": "Allahs"})
+    monkeypatch.setattr(bot, "_GLOSSARY_RE", re.compile(r"\b(Gottes|Gott)\b"))
+    assert bot.apply_glossary(text) == expected
+
+
+def test_glossary_configuration_is_validated(bot):
+    assert bot._parse_glossary("Gott=Allah, Koran=Qur'an") == {"Gott": "Allah", "Koran": "Qur'an"}
+    assert bot._parse_glossary("") == {}
+    with pytest.raises(ValueError, match="wrong=right"):
+        bot._parse_glossary("Gott")
+    assert bot._parse_seed_context('[["a", "b"]]') == [("a", "b")]
+    with pytest.raises(ValueError, match="JSON"):
+        bot._parse_seed_context("not json")
+    with pytest.raises(ValueError, match="empty source or target"):
+        bot._parse_seed_context('[["a", " "]]')
+
+
+def test_kaggle_offers_a_prompt_steerable_translator(bot):
+    """TranslateGemma cannot take a system prompt, so there has to be a way out.
+
+    Its template rejects the system role outright, which means register and
+    terminology can only be configured. The alternative is the plain instruction
+    model of the same size, where the same rules are simply written down.
+    """
+    translators = kaggle_literal("TRANSLATORS")
+    assert set(translators) == {"translategemma", "instruct"}
+    assert kaggle_literal("TRANSLATOR") in translators
+
+    instruct = translators["instruct"]
+    assert instruct["TRANSLATION_BACKEND"] == "chat", "must take the system-prompt path"
+    assert instruct["TRANSLATION_BACKEND"] != "translategemma"
+    prompt = instruct["TRANSLATION_SYSTEM_PROMPT"]
+    # The prompt has to carry what the other variant needs a glossary for.
+    assert "Allah" in prompt and "khutba" in prompt and "transliterated" in prompt
+    assert bot.GEMMA_MAX_INPUT_TOKENS > len(prompt) // 4, "prompt must fit the window"
+
+
+def test_kaggle_profile_carries_the_khutba_translation_profile():
+    profile = kaggle_literal("PROFILE")
+    glossary = profile["TRANSLATION_GLOSSARY"]
+    assert "Gott=Allah" in glossary and "Gottes=Allahs" in glossary
+    seeds = json.loads(profile["TRANSLATION_SEED_CONTEXT"])
+    assert len(seeds) >= 2
+    assert all(len(pair) == 2 and all(pair) for pair in seeds)
+    # The examples have to demonstrate the terminology they are meant to teach.
+    assert all("Allah" in target for _source, target in seeds)
+    assert not any("Gott" in target for _source, target in seeds)
 
 
 def test_gemma_context_is_trimmed_to_its_input_window(bot):

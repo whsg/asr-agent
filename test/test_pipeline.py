@@ -592,6 +592,27 @@ def test_time_stretch_shortens_the_audio_but_not_the_pitch(bot, speed):
     assert loudness(out) == pytest.approx(loudness(audio), rel=0.2)
 
 
+@pytest.mark.parametrize("seconds", [1.0, 3.0, 6.0])
+@pytest.mark.parametrize("speed", [1.1, 1.25, 1.35])
+def test_time_stretch_still_reaches_the_end_of_the_audio(bot, seconds, speed):
+    """The failure that cut off the ends of spoken sentences.
+
+    Output *length* alone proves nothing here: it follows from the frame count
+    whether or not the read position ever reached the input's tail. So mark the
+    last 150 ms and check the mark actually comes out.
+    """
+    rate = bot.AUDIO_SAMPLE_RATE
+    audio = np.zeros(int(rate * seconds), dtype=np.float32)
+    marker = int(0.15 * rate)
+    audio[-marker:] = tone(bot, 0.15, hz=900.0)
+
+    out = bot.time_stretch(audio, speed)
+
+    assert float(np.sqrt(np.mean(out[-marker:] ** 2))) > 0.2, "the tail never made it out"
+    loud = np.nonzero(np.abs(out) > 0.05)[0]
+    assert loud.size and (loud[-1] + 1) / out.size > 0.95, "playback stops short of the end"
+
+
 def test_time_stretch_leaves_normal_speed_untouched(bot):
     audio = tone(bot, 1.0)
     assert bot.time_stretch(audio, 1.0) is audio

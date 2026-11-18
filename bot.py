@@ -120,8 +120,11 @@ COHERE_LANGUAGE = os.getenv("COHERE_LANGUAGE", "ar").strip() or "ar"
 # --- Translation -----------------------------------------------------------
 TRANSLATION_MODEL = os.getenv("TRANSLATION_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 TRANSLATION_BACKEND = os.getenv("TRANSLATION_BACKEND", "qwen").strip().lower()
-if TRANSLATION_BACKEND not in ("qwen", "translategemma"):
-    raise ValueError("TRANSLATION_BACKEND must be qwen or translategemma.")
+# chat/qwen: any instruction-tuned model, steered by TRANSLATION_SYSTEM_PROMPT.
+# translategemma: Google's dedicated MT model, whose template writes its own
+# instruction and rejects a system role - steerable only by example.
+if TRANSLATION_BACKEND not in ("qwen", "chat", "translategemma"):
+    raise ValueError("TRANSLATION_BACKEND must be chat, qwen or translategemma.")
 TRANSLATION_SOURCE_LANG = os.getenv("TRANSLATION_SOURCE_LANG", "ar").strip() or "ar"
 TRANSLATION_TARGET_LANG = os.getenv("TRANSLATION_TARGET_LANG", "de").strip() or "de"
 # 4-bit NF4 dequantises every weight on every decoded token, which on a T4 is
@@ -168,11 +171,19 @@ TORCH_CPU_THREADS = _env_int("TORCH_CPU_THREADS", 0, minimum=0)
 # explanation" prompt.
 TRANSLATION_SYSTEM_PROMPT = os.getenv("TRANSLATION_SYSTEM_PROMPT", "").strip() or (
     "You are a professional simultaneous interpreter rendering a Friday sermon "
-    "(Jumu'ah khutba) from {src} to {tgt}. The input arrives in short spoken "
-    "fragments and may end mid-sentence: render each one faithfully, keep the "
-    "solemn sermon register, keep proper names and Qur'anic phrases in their "
-    "standard transliteration, and stay consistent with the earlier turns. "
-    "Reply with the {tgt} translation only - no notes, no explanation, no "
+    "(Jumu'ah khutba) from {src} to {tgt}.\n"
+    "Wording:\n"
+    "- Render the name of God as 'Allah', never as a {tgt} common noun.\n"
+    "- Keep Qur'anic and prophetic formulas in their established wording, e.g. "
+    "sall-Allahu alayhi wa-sallam as 'Allahs Segen und Friede seien auf ihm'.\n"
+    "- Keep proper names and religious terms in their standard transliteration "
+    "(Muhammad, Qur'an, Sunna, Hadith), not translated or localised.\n"
+    "- Keep the solemn sermon register and the speaker's form of address.\n"
+    "Delivery:\n"
+    "- The input arrives in short spoken fragments and may end mid-sentence: "
+    "render each fragment faithfully and never invent its continuation.\n"
+    "- Stay consistent with the earlier turns shown above.\n"
+    "- Reply with the {tgt} translation only - no notes, no explanation, no "
     "repetition of the {src} source."
 ).format(src=TRANSLATION_SOURCE_LANG, tgt=TRANSLATION_TARGET_LANG)
 # How many previous (source, translation) pairs to send as chat context so the
@@ -182,6 +193,62 @@ TRANSLATION_SYSTEM_PROMPT = os.getenv("TRANSLATION_SYSTEM_PROMPT", "").strip() o
 # context is re-prefilled on each request, so it trades latency for quality;
 # 4 is a good balance, less for TranslateGemma's 2048-token input window.
 TRANSLATION_CONTEXT_TURNS = _env_int("TRANSLATION_CONTEXT_TURNS", 4, minimum=0)
+# Fixed example pairs placed in front of every request as JSON [[source, target], ...].
+# For TranslateGemma this is the ONLY way to set register and terminology at
+# all: its official template hardcodes its own instruction and has no system
+# role, so a prompt cannot reach it - a worked example can. These never rotate
+# out and are never dropped when the input window gets tight.
+TRANSLATION_SEED_CONTEXT = os.getenv("TRANSLATION_SEED_CONTEXT", "").strip()
+# Terms the translation must use, as "wrong=right" pairs separated by commas.
+# Applied to whole words only, so "Gott=Allah" rewrites "Gott" and leaves
+# "Gottesdienst" alone. The deterministic net under the examples above: a
+# model can be steered, but only a substitution guarantees a term.
+TRANSLATION_GLOSSARY = os.getenv("TRANSLATION_GLOSSARY", "").strip()
+
+
+def _parse_seed_context(raw: str) -> list[tuple[str, str]]:
+    if not raw:
+        return []
+    try:
+        pairs = json.loads(raw)
+        seeds = [(str(source), str(target)) for source, target in pairs]
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            'TRANSLATION_SEED_CONTEXT must be JSON like [["source", "target"], ...]; '
+            f"could not read it: {exc}"
+        ) from exc
+    if any(not source.strip() or not target.strip() for source, target in seeds):
+        raise ValueError("TRANSLATION_SEED_CONTEXT contains an empty source or target.")
+    return seeds
+
+
+def _parse_glossary(raw: str) -> dict[str, str]:
+    terms: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        wrong, _, right = entry.partition("=")
+        if not wrong.strip() or not right.strip():
+            raise ValueError(f"TRANSLATION_GLOSSARY entry {entry!r} is not 'wrong=right'.")
+        terms[wrong.strip()] = right.strip()
+    return terms
+
+
+SEED_CONTEXT = _parse_seed_context(TRANSLATION_SEED_CONTEXT)
+GLOSSARY = _parse_glossary(TRANSLATION_GLOSSARY)
+_GLOSSARY_RE = re.compile(
+    r"\b(" + "|".join(re.escape(term) for term in sorted(GLOSSARY, key=len, reverse=True)) + r")\b"
+) if GLOSSARY else None
+
+
+def apply_glossary(text: str) -> str:
+    """Enforces the configured terminology on whole words."""
+    if _GLOSSARY_RE is None:
+        return text
+    return _GLOSSARY_RE.sub(lambda match: GLOSSARY[match.group(0)], text)
+
+
 # Hard ceiling for generated tokens, shared by the ASR and the translator. The
 # effective limit per request is derived from the input, so normal turns stop
 # long before this; it only exists to stop a degenerate decode.
@@ -812,7 +879,7 @@ def _gemma_messages(text: str, context: list[tuple[str, str]]) -> list[dict]:
         }
 
     messages: list[dict] = []
-    for previous_source, previous_target in context:
+    for previous_source, previous_target in [*SEED_CONTEXT, *context]:
         messages.append(request(previous_source))
         # Its template rejects a content list on the assistant role.
         messages.append({"role": "assistant", "content": previous_target})
@@ -875,7 +942,7 @@ def chat_inputs(owner, text: str, context: list[tuple[str, str]]):
     # Interleaved source/translation pairs. Sending all sources first and
     # all translations afterwards (as an earlier version did) destroys the
     # few-shot pattern and measurably degrades the output.
-    for previous_source, previous_target in context:
+    for previous_source, previous_target in [*SEED_CONTEXT, *context]:
         messages.append({"role": "user", "content": previous_source})
         messages.append({"role": "assistant", "content": previous_target})
     messages.append({"role": "user", "content": text})
@@ -1407,22 +1474,29 @@ def time_stretch(audio: np.ndarray, speed: float) -> np.ndarray:
     frames = int(np.ceil((audio.size - window) / hop_in)) + 1
     out = np.zeros((frames - 1) * hop_out + window, dtype=np.float32)
     weight = np.zeros_like(out)
-    start = 0
+    reference = None
     for index in range(frames):
+        # The read position follows a fixed grid and the search only shifts the
+        # current frame. Anchoring the search on the previous *chosen* position
+        # instead lets the shifts accumulate, and the tail of the chunk is then
+        # never reached - which drops the end of the sentence.
+        nominal = index * hop_in
+        start = nominal
+        if reference is not None and float(reference @ reference) > 1e-9:
+            low = max(0, nominal - search)
+            high = min(audio.size - window, nominal + search)
+            if high > low:
+                candidates = np.lib.stride_tricks.sliding_window_view(
+                    audio[low:high + window], window)
+                start = low + int(np.argmax(candidates @ reference))
         frame = audio[start:start + window]
         at = index * hop_out
         out[at:at + frame.size] += frame * taper[:frame.size]
         weight[at:at + frame.size] += taper[:frame.size]
-        # The next frame has to continue this one, so take the segment near the
-        # nominal read position that matches that continuation best.
+        # What the next frame has to continue, so the splice stays periodic.
         reference = audio[start + hop_out:start + hop_out + window]
-        low = max(0, start + hop_in - search)
-        high = min(audio.size - window, start + hop_in + search)
-        if high <= low or reference.size < window:
-            start += hop_in
-            continue
-        candidates = np.lib.stride_tricks.sliding_window_view(audio[low:high + window], window)
-        start = low + int(np.argmax(candidates @ reference))
+        if reference.size < window:
+            reference = None
     return np.divide(out, weight, out=np.zeros_like(out), where=weight > 1e-3)
 
 
@@ -1771,7 +1845,7 @@ class Pipeline:
         if failure:
             raise failure[0]
 
-        turn.translation = turn.translation.strip()
+        turn.translation = apply_glossary(turn.translation.strip())
         turn.translation_ms = (time.monotonic() - started) * 1000
         if partial is not None:
             # The last partial must be on the wire before the final text, or it
@@ -1803,6 +1877,7 @@ class Pipeline:
             turn, text, last = await self.tts_queue.get()
             samples = np.zeros(0, dtype=np.float32)
             try:
+                text = apply_glossary(text)
                 if is_speakable(text):
                     started = time.monotonic()
                     samples = await self.tts_gpu.run(PRIO_SPEECH, self.speech.synthesize, text)
@@ -2086,6 +2161,8 @@ def run_smoke_test(asr: AsrEngine, translator: Translator, speech: SpeechSynthes
     translated = "".join(pieces).strip()
     if not translated:
         raise RuntimeError("Smoke-test translation returned no text.")
+    # The live path enforces the terminology too, so the saved audio must hear it.
+    translated = apply_glossary(translated)
     # The rolling context is a prompt path of its own, and the live agent only
     # reaches it from the second turn on. This is the only check that runs
     # against the real model, so it has to cover that path too.
@@ -2127,6 +2204,8 @@ def run_smoke_test(asr: AsrEngine, translator: Translator, speech: SpeechSynthes
         "source_text": source,
         "german_text": translated,
         "translation_context_turns": TRANSLATION_CONTEXT_TURNS,
+        "translation_seed_examples": len(SEED_CONTEXT),
+        "translation_glossary": GLOSSARY,
         "german_text_with_context": context_translated,
         "asr_tested_on_supplied_audio": bool(audio_path),
         "input_audio_seconds": input_seconds,
@@ -2365,6 +2444,11 @@ async def main(smoke_dir: str | None = None, test_audio: str | None = None) -> N
     logger.info("Catch-up: playout up to %.2fx from %.1f s backlog, turns dropped only beyond %.1f s",
                 MAX_PLAYOUT_SPEED, SPEEDUP_BACKLOG_SECONDS, MAX_AUDIO_BACKLOG_SECONDS)
     logger.info("Translation context: %d previous turn(s)", TRANSLATION_CONTEXT_TURNS)
+    logger.info("Translation profile: %d seed example(s), %d glossary term(s)%s",
+                len(SEED_CONTEXT), len(GLOSSARY),
+                "" if SEED_CONTEXT or TRANSLATION_BACKEND != "translategemma" else
+                " - WARNING: TranslateGemma ignores the system prompt, so without seed "
+                "examples it translates with its own generic instruction only")
     logger.info("Max utterance length: %.2f s", MAX_UTTERANCE_SECONDS)
     logger.info("End-of-speech silence: %.2f s", END_SILENCE_SECONDS)
     logger.info("Max generated tokens per pass: %d", MAX_GEN_TOKENS)
