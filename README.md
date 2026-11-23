@@ -282,6 +282,58 @@ before resetting, and redact any credentials before sharing.
 
 All variables are documented in [.env.example](./.env.example).
 
+### Runpod GPU Pod prototype
+
+For complete image build, Push, Pod configuration, and environment-variable
+instructions, see [RUNPOD_DEPLOYMENT.md](./RUNPOD_DEPLOYMENT.md).
+
+The repository includes a Runpod-friendly container for a **single 48 GB GPU**.
+It does not use a persistent model cache: Hugging Face weights and GGUF files
+are downloaded from Hugging Face on container startup and remain only in the
+container's ephemeral storage.
+
+Build the image locally or in a container registry:
+
+```bash
+docker build -t asr-agent:runpod .
+```
+
+When creating the Runpod Pod, use a 48 GB NVIDIA GPU, expose no public HTTP port
+for the agent, and set these environment variables:
+
+```text
+HF_TOKEN=hf_...
+LIVEKIT_URL=wss://your-project.livekit.cloud
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+LIVEKIT_ROOM=arabic-asr-live
+TRANSLATION_ENGINE=llamacpp
+TRANSLATION_BACKEND=translategemma
+TRANSLATION_MODEL=google/translategemma-12b-it
+ASR_DEVICE=cuda:0
+TRANSLATION_DEVICE=cuda:0
+TTS_DEVICE=cpu
+GPU_CONCURRENCY=1
+COHERE_4BIT=0
+TTS_BACKEND=phonon
+TORCH_CPU_THREADS=1
+PHONON_THREADS=2
+```
+
+The container entrypoint starts the bot and checks for a precompiled
+`llama-server` first:
+
+1. `LLAMA_SERVER_BIN`, if set to an executable custom path.
+2. `llama-server` on `PATH`.
+3. Common container/workspace locations.
+4. `/tmp/llama.cpp/build/bin/llama-server`, if built earlier in the container.
+5. The pinned CUDA 12.8 Linux x64 release for `b12361`, or
+   `LLAMA_SERVER_DOWNLOAD_URL` when overriding that package.
+
+Only after these checks does it build the pinned source for the actual GPU
+architecture at first startup. This prototype does not compile into persistent
+storage; it may need to rebuild after a fresh container.
+
 **Hugging Face setup:** accept the model terms for
 [Cohere Transcribe Arabic](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026)
 and [Phonon German](https://huggingface.co/gradium/phonon-40m-de) (plus
