@@ -4,6 +4,13 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
+# Optional quick-test credentials: uncomment and replace every placeholder.
+# Keep real values local to the Pod; do not commit them to the branch.
+export LIVEKIT_URL="wss://sts-spxqczbe.livekit.cloud"
+export LIVEKIT_API_KEY="APID2mWegf8UgVL"
+export LIVEKIT_API_SECRET="4u8tFhhSZeFO9nOXrtnAT3km3O0zfO265rWPZM6FIftB"
+export HF_TOKEN="hf_YOUR_HUGGINGFACE_TOKEN"
+
 if [[ -z "${LIVEKIT_URL:-}" || -z "${LIVEKIT_API_KEY:-}" || -z "${LIVEKIT_API_SECRET:-}" || -z "${HF_TOKEN:-}" ]] \
     && [[ ! -f "$PROJECT_ROOT/.env" ]]; then
     echo "Set the required credentials in the Pod environment or provide a .env file in the project root." >&2
@@ -70,6 +77,13 @@ if [[ -z "${LIVEKIT_URL:-}" || -z "${LIVEKIT_API_KEY:-}" || -z "${LIVEKIT_API_SE
     exit 2
 fi
 
+for name in LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET HF_TOKEN; do
+    if [[ "${!name}" == *YOUR_* || "${!name}" == *PLACEHOLDER* ]]; then
+        echo "Replace the placeholder value for $name before starting." >&2
+        exit 2
+    fi
+done
+
 if ! "$VENV_PYTHON" -c 'import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)' >/dev/null 2>&1; then
     "$VENV_PYTHON" -m pip install --upgrade --force-reinstall \
         --index-url https://download.pytorch.org/whl/cu128 torch torchaudio
@@ -90,7 +104,22 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export LIVEKIT_ROOM="${LIVEKIT_ROOM:-arabic-asr-live}"
 export BACKEND_HOST="${BACKEND_HOST:-0.0.0.0}"
 export BACKEND_PORT="${BACKEND_PORT:-8000}"
-export TRANSLATION_ENGINE="${TRANSLATION_ENGINE:-transformers}"
+export TRANSLATION_ENGINE="${TRANSLATION_ENGINE:-llamacpp}"
+export TRANSLATION_BACKEND="${TRANSLATION_BACKEND:-translategemma}"
+export TRANSLATION_MODEL="${TRANSLATION_MODEL:-google/translategemma-12b-it}"
+export LLAMA_GGUF_REPO="${LLAMA_GGUF_REPO:-mradermacher/translategemma-12b-it-GGUF}"
+export LLAMA_GGUF_FILE="${LLAMA_GGUF_FILE:-translategemma-12b-it.Q8_0.gguf}"
+export LLAMA_CTX="${LLAMA_CTX:-3072}"
+export LLAMA_THREADS="${LLAMA_THREADS:-1}"
+export LLAMA_SERVER_LOG="${LLAMA_SERVER_LOG:-/tmp/llama-server.log}"
+export ASR_DEVICE="${ASR_DEVICE:-cuda:0}"
+export TRANSLATION_DEVICE="${TRANSLATION_DEVICE:-cuda:0}"
+export TTS_DEVICE="${TTS_DEVICE:-cpu}"
+export TTS_BACKEND="${TTS_BACKEND:-phonon}"
+export GPU_CONCURRENCY="${GPU_CONCURRENCY:-1}"
+export TORCH_CPU_THREADS="${TORCH_CPU_THREADS:-1}"
+export PHONON_THREADS="${PHONON_THREADS:-2}"
+export COHERE_4BIT="${COHERE_4BIT:-0}"
 
 if [[ ! "$BACKEND_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$BACKEND_PORT < 1 || 10#$BACKEND_PORT > 65535 )); then
     echo "BACKEND_PORT must be an integer from 1 to 65535." >&2
