@@ -9,7 +9,6 @@ cd "$PROJECT_ROOT"
 export LIVEKIT_URL="wss://sts-spxqczbe.livekit.cloud"
 export LIVEKIT_API_KEY="APID2mWegf8UgVL"
 export LIVEKIT_API_SECRET="4u8tFhhSZeFO9nOXrtnAT3km3O0zfO265rWPZM6FIftB"
-export HF_TOKEN="hf_YOUR_HUGGINGFACE_TOKEN"
 
 if [[ -z "${LIVEKIT_URL:-}" || -z "${LIVEKIT_API_KEY:-}" || -z "${LIVEKIT_API_SECRET:-}" || -z "${HF_TOKEN:-}" ]] \
     && [[ ! -f "$PROJECT_ROOT/.env" ]]; then
