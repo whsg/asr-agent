@@ -46,9 +46,9 @@ and web backend) or the Docker image path that follows.
 On the first run, the script installs system and Python dependencies, checks
 that PyTorch can use the GPU, then starts the bot and FastAPI backend together.
 The bot downloads its models on first startup. Hugging Face model files are
-stored in `/workspace/.cache/huggingface`. The script uses the bot's code
-defaults (Qwen3 4B with Transformers); Dockerfile
-environment defaults are not applied to a Runpod Base Pod.
+stored in `/workspace/.cache/huggingface`. The Runpod script defaults to
+TranslateGemma 27B Q8_0 via llama.cpp; Dockerfile environment defaults are
+used only when running the container image.
 
 Open the Pod's HTTP proxy URL for the web client; `/api/health` checks the web
 backend. The backend is intentionally public in this setup, but `/api/session`
@@ -72,7 +72,7 @@ You need:
 Accept the Hugging Face access terms for:
 
 - [Cohere Transcribe Arabic](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026)
-- [TranslateGemma 12B FP16](https://huggingface.co/google/translategemma-12b-it)
+- [TranslateGemma 27B GGUF](https://huggingface.co/mradermacher/translategemma-27b-it-GGUF)
 - [Gradium Phonon German](https://huggingface.co/gradium/phonon-40m-de)
 
 Create a read-capable Hugging Face token at
@@ -119,7 +119,7 @@ Pod template or deployment form before launching the Pod.
    Replace `<YOUR_REGISTRY>` with your Docker Hub username or registry
    namespace.
 
-6. Select a GPU with at least **48 GB of VRAM** for the FP16 12B model and ASR.
+6. Select a GPU with at least **48 GB of VRAM** for the 27B Q8_0 GGUF and ASR.
 7. Configure enough container and volume storage for downloaded model weights,
    temporary llama.cpp files, and logs.
 8. Do not expose any HTTP or TCP port. The bot uses outbound LiveKit
@@ -128,9 +128,9 @@ Pod template or deployment form before launching the Pod.
 
 ### GPU selection
 
-The default image runs both Cohere ASR and the unquantized TranslateGemma 12B FP16 model on one GPU.
+The default image runs Cohere ASR and TranslateGemma 27B as a llama.cpp GGUF model on one GPU.
 
-- A 48 GB GPU is the documented starting point. Memory use can vary with the context window and inference caches.
+- A 48 GB GPU is the documented starting point. The default Q8_0 file is about 28.8 GB.
 - ASR and translation share `cuda:0` in this default profile.
 - TTS runs on the CPU.
 - Use a Secure Cloud GPU for the most predictable network and GPU behavior.
@@ -174,11 +174,11 @@ The Docker image already sets these defaults. Add them explicitly if you are
 creating a custom Runpod template or overriding an earlier template:
 
 ```text
-TRANSLATION_ENGINE=transformers
+TRANSLATION_ENGINE=llamacpp
 TRANSLATION_BACKEND=translategemma
-TRANSLATION_MODEL=google/translategemma-12b-it
-TRANSLATION_DTYPE=float16
-TRANSLATION_4BIT=0
+TRANSLATION_MODEL=google/translategemma-27b-it
+LLAMA_GGUF_REPO=mradermacher/translategemma-27b-it-GGUF
+LLAMA_GGUF_FILE=translategemma-27b-it.Q8_0.gguf
 LLAMA_CTX=3072
 LLAMA_THREADS=1
 ASR_DEVICE=cuda:0
@@ -200,10 +200,11 @@ LIVEKIT_URL: wss://your-project.livekit.cloud
 LIVEKIT_API_KEY: APIxxxxxxxx
 LIVEKIT_API_SECRET: xxxxxxxxxxxxxxxx
 LIVEKIT_ROOM: arabic-asr-live
-TRANSLATION_ENGINE: transformers
+TRANSLATION_ENGINE: llamacpp
 TRANSLATION_BACKEND: translategemma
-TRANSLATION_MODEL: google/translategemma-12b-it
-TRANSLATION_DTYPE: float16
+TRANSLATION_MODEL: google/translategemma-27b-it
+LLAMA_GGUF_REPO: mradermacher/translategemma-27b-it-GGUF
+LLAMA_GGUF_FILE: translategemma-27b-it.Q8_0.gguf
 ASR_DEVICE: cuda:0
 TRANSLATION_DEVICE: cuda:0
 TTS_DEVICE: cpu
