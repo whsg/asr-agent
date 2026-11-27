@@ -739,96 +739,6 @@ def test_pipeline_uses_separate_tts_admission(bot):
     asyncio.run(scenario())
 
 
-def test_smoke_test_saves_real_outputs_and_honest_metrics(bot, monkeypatch, tmp_path):
-    writes = {}
-    monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace(
-        write=lambda path, audio, rate, **kwargs: writes.update(
-            path=path, audio=audio, rate=rate),
-    ))
-    translator = SimpleNamespace(
-        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."),
-        translate=lambda text, context=(): "Guten Morgen.")
-    speech = SimpleNamespace(synthesize=lambda text: np.ones(24_000, dtype=np.float32))
-    bot.run_smoke_test(None, translator, speech, str(tmp_path))
-    metrics = json.loads((tmp_path / "metrics.json").read_text())
-    assert writes["path"] == tmp_path / "german.wav"
-    assert writes["rate"] == bot.AUDIO_SAMPLE_RATE
-    assert metrics["german_text"] == "Guten Morgen."
-    assert metrics["output_audio_seconds"] == 1
-    assert metrics["asr_tested_on_supplied_audio"] is False
-    assert metrics["asr_seconds"] is None
-    assert "NOT live" in metrics["timing_scope"]
-
-
-def test_smoke_test_covers_the_rolling_context_prompt(bot, monkeypatch, tmp_path):
-    """The context is its own prompt path, and only the real model can judge it.
-
-    The live agent reaches it from the second turn on, so a smoke test that
-    only ever translates with an empty history cannot catch a template that
-    rejects earlier turns - which is exactly how that bug reached a live run.
-    """
-    monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace(
-        write=lambda *args, **kwargs: None))
-    contexts = []
-    translator = SimpleNamespace(
-        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."),
-        translate=lambda text, context=(): (contexts.append(list(context)), "Mit Kontext.")[1])
-    speech = SimpleNamespace(synthesize=lambda text: np.ones(24_000, dtype=np.float32))
-
-    bot.run_smoke_test(None, translator, speech, str(tmp_path))
-
-    assert contexts == [[("الحمد لله رب العالمين. نسأل الله أن يرزقنا العلم النافع والعمل الصالح.",
-                          "Guten Morgen.")]]
-    metrics = json.loads((tmp_path / "metrics.json").read_text())
-    assert metrics["german_text_with_context"] == "Mit Kontext."
-
-
-def test_smoke_test_fails_if_gemma_silently_dropped_the_context(bot, monkeypatch, tmp_path):
-    """Degrading quietly is right in a live room, but wrong in a pre-flight check."""
-    monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace(
-        write=lambda *args, **kwargs: None))
-    monkeypatch.setattr(bot, "TRANSLATION_BACKEND", "translategemma")
-    monkeypatch.setattr(bot, "_gemma_context_supported", False)
-    translator = SimpleNamespace(
-        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."),
-        translate=lambda text, context=(): "Ohne Kontext.")
-    speech = SimpleNamespace(synthesize=lambda text: np.ones(24_000, dtype=np.float32))
-
-    with pytest.raises(RuntimeError, match="rejected the rolling context"):
-        bot.run_smoke_test(None, translator, speech, str(tmp_path))
-
-
-@pytest.mark.parametrize("input_seconds, valid", [(1.0, True), (13.0, False)])
-def test_smoke_test_uses_supplied_arabic_audio(bot, monkeypatch, tmp_path, input_seconds, valid):
-    monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace(
-        read=lambda *args, **kwargs: (np.zeros((int(16_000 * input_seconds), 2)), 16_000),
-        write=lambda *args, **kwargs: None,
-    ))
-    calls = []
-
-    def transcribe(audio):
-        calls.append(audio.shape)
-        return "نص عربي"
-
-    asr = SimpleNamespace(transcribe=transcribe)
-    translator = SimpleNamespace(
-        quantized=True, stream=lambda text, context, emit: emit("Guten Morgen."),
-        translate=lambda text, context=(): "Guten Morgen.")
-    speech = SimpleNamespace(synthesize=lambda text: np.ones(24_000, dtype=np.float32))
-    if not valid:
-        with pytest.raises(ValueError, match="between 0 and"):
-            bot.run_smoke_test(asr, translator, speech, str(tmp_path), "private.wav")
-        assert not calls
-        return
-    bot.run_smoke_test(asr, translator, speech, str(tmp_path), "private.wav")
-    metrics = json.loads((tmp_path / "metrics.json").read_text())
-    assert metrics["asr_tested_on_supplied_audio"] is True
-    assert metrics["input_audio_seconds"] == input_seconds
-    assert metrics["asr_seconds"] is not None
-    assert metrics["source_text"] == "نص عربي"
-    assert calls == [(16_000,)]
-
-
 def test_kaggle_runner_puts_child_traceback_into_error(tmp_path):
     output = (
         "INFO Loading Phonon ...\n"
@@ -857,7 +767,7 @@ def test_kaggle_runner_puts_child_traceback_into_error(tmp_path):
     }
     exec(compile(tree, "kaggle-runner", "exec"), namespace)
     with pytest.raises(RuntimeError) as error:
-        namespace["run_logged"](["bot.py", "--smoke-test", "out"], "smoke-test.log")
+        namespace["run_logged"](["bot.py"], "bot.log")
     message = str(error.value)
     assert "CUDA out of memory on cuda:1" in message
     assert message.index("Traceback (most recent") < message.index("CUDA out of memory")

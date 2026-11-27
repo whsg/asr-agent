@@ -2123,129 +2123,6 @@ class Pipeline:
 # ---------------------------------------------------------------------------
 
 
-def run_smoke_test(asr: AsrEngine, translator: Translator, speech: SpeechSynthesizer,
-                   output_dir: str, audio_path: str | None = None) -> None:
-    """Save real model outputs and sequential timings, without a LiveKit room."""
-    import soundfile as sf
-
-    destination = Path(output_dir)
-    destination.mkdir(parents=True, exist_ok=True)
-    source = "الحمد لله رب العالمين. نسأل الله أن يرزقنا العلم النافع والعمل الصالح."
-    asr_seconds = None
-    input_seconds = None
-    if audio_path:
-        audio, rate = sf.read(audio_path, dtype="float32", always_2d=True)
-        audio = _resample(audio.mean(axis=1), rate, SAMPLE_RATE)
-        input_seconds = audio.size / SAMPLE_RATE
-        if not 0 < input_seconds <= MAX_UTTERANCE_SECONDS or not np.isfinite(audio).all():
-            raise ValueError(
-                f"Smoke-test audio must be finite and between 0 and {MAX_UTTERANCE_SECONDS} seconds."
-            )
-        started = time.monotonic()
-        source = asr.transcribe(audio)
-        asr_seconds = time.monotonic() - started
-        if not source.strip():
-            raise RuntimeError("Smoke-test ASR returned no text for the supplied audio.")
-    started = time.monotonic()
-    first_token_seconds = None
-    pieces: list[str] = []
-
-    def emit(piece: str) -> None:
-        nonlocal first_token_seconds
-        if piece and first_token_seconds is None:
-            first_token_seconds = time.monotonic() - started
-        pieces.append(piece)
-
-    translator.stream(source, [], emit)
-    translation_seconds = time.monotonic() - started
-    translated = "".join(pieces).strip()
-    if not translated:
-        raise RuntimeError("Smoke-test translation returned no text.")
-    # The live path enforces the terminology too, so the saved audio must hear it.
-    translated = apply_glossary(translated)
-    # The rolling context is a prompt path of its own, and the live agent only
-    # reaches it from the second turn on. This is the only check that runs
-    # against the real model, so it has to cover that path too.
-    context_translated = ""
-    if TRANSLATION_CONTEXT_TURNS:
-        context_translated = translator.translate(source, [(source, translated)])
-        if not context_translated.strip():
-            raise RuntimeError("Smoke-test translation with rolling context returned no text.")
-        if TRANSLATION_BACKEND == "translategemma" and not _gemma_context_supported:
-            raise RuntimeError(
-                "TranslateGemma's chat template rejected the rolling context "
-                f"({_gemma_context_error}), so every turn would be translated without any "
-                "discourse. Set TRANSLATION_CONTEXT_TURNS=0 to accept that deliberately."
-            )
-    buffer = translated
-    chunks: list[np.ndarray] = []
-    chunk_times: list[float] = []
-    while buffer:
-        chunk, rest = split_speakable(buffer, len(chunks), flush=False)
-        if not chunk:
-            chunk, rest = split_speakable(buffer, len(chunks), flush=True)
-        started = time.monotonic()
-        samples = speech.synthesize(chunk)
-        if samples.size == 0 or not np.isfinite(samples).all():
-            raise RuntimeError("Smoke-test TTS returned empty or non-finite audio.")
-        chunk_times.append(time.monotonic() - started)
-        chunks.append(samples)
-        buffer = rest
-    waveform = np.concatenate(chunks)
-    audio_seconds = waveform.size / AUDIO_SAMPLE_RATE
-    sf.write(destination / "german.wav", waveform, AUDIO_SAMPLE_RATE, subtype="PCM_16")
-    metrics = {
-        "translation_model": TRANSLATION_MODEL,
-        "translation_backend": TRANSLATION_BACKEND,
-        "translation_engine": TRANSLATION_ENGINE,
-        "translation_4bit": translator.quantized,
-        "translation_dtype": str(getattr(translator, "dtype", None)),
-        "tts_model": PHONON_MODEL if TTS_BACKEND == "phonon" else XTTS_MODEL_NAME,
-        "source_text": source,
-        "german_text": translated,
-        "translation_context_turns": TRANSLATION_CONTEXT_TURNS,
-        "translation_seed_examples": len(SEED_CONTEXT),
-        "translation_glossary": GLOSSARY,
-        "german_text_with_context": context_translated,
-        "asr_tested_on_supplied_audio": bool(audio_path),
-        "input_audio_seconds": input_seconds,
-        "asr_seconds": asr_seconds,
-        "translation_seconds": translation_seconds,
-        "first_token_seconds": first_token_seconds,
-        "translation_tokens_per_second": (getattr(translator, "last_timings", None) or {}).get(
-            "predicted_per_second"),
-        # < 1 means the translator is faster than the speech; aim well below
-        # 0.5 so it keeps up with continuous speech and catches up after bursts.
-        "translation_to_speech_ratio": translation_seconds / input_seconds if input_seconds else None,
-        "tts_seconds": sum(chunk_times),
-        "tts_chunk_seconds": chunk_times,
-        "output_audio_seconds": audio_seconds,
-        "tts_rtf": sum(chunk_times) / audio_seconds,
-        "timing_scope": "Sequential offline test after warm-up; NOT live end-to-end latency.",
-    }
-    if torch.cuda.is_available():
-        used = {pick_device_dtype(device)[1] for device in (ASR_DEVICE, TRANSLATION_DEVICE, TTS_DEVICE)}
-        if TRANSLATION_ENGINE == "llamacpp":
-            # llama.cpp's VRAM lives in another process; querying PyTorch here
-            # would only create an extra context on that GPU.
-            used.discard(pick_device_dtype(TRANSLATION_DEVICE)[1])
-        metrics["gpu_peak_allocated_gib"] = {
-            device: torch.cuda.max_memory_allocated(int(device.split(":")[1])) / 2**30
-            for device in sorted(used) if device != "cpu"
-        }
-    (destination / "metrics.json").write_text(
-        json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
-    )
-    tokens_per_second = metrics["translation_tokens_per_second"]
-    logger.info("Smoke test saved to %s | MT %.2fs%s | TTS RTF %.2f (must be <1 to keep up).",
-                destination, translation_seconds,
-                f" ({tokens_per_second:.1f} tok/s)" if tokens_per_second else "", metrics["tts_rtf"])
-    if not audio_path:
-        logger.warning("Smoke test used Arabic text, not microphone audio; ASR accuracy was NOT tested.")
-    if metrics["tts_rtf"] >= 1:
-        logger.warning("TTS is slower than real time on this sample. Live STS will build a backlog.")
-
-
 def prepare_models() -> tuple[AsrEngine, Translator, SpeechSynthesizer]:
     dtype, device = pick_device_dtype(ASR_DEVICE)
     default_translation_dtype, translation_device = pick_device_dtype(TRANSLATION_DEVICE)
@@ -2401,7 +2278,7 @@ async def run_room(asr: AsrEngine, translator: Translator, speech: SpeechSynthes
         await audio_source.aclose()
 
 
-async def main(smoke_dir: str | None = None, test_audio: str | None = None) -> None:
+async def main() -> None:
     # asyncio.to_thread shares one executor; Colab's 2 vCPUs would otherwise
     # cap it at six threads for ASR, translation, TTS and the VAD handoff.
     asyncio.get_running_loop().set_default_executor(
@@ -2412,16 +2289,15 @@ async def main(smoke_dir: str | None = None, test_audio: str | None = None) -> N
     key = os.environ.get("LIVEKIT_API_KEY", "").strip()
     secret = os.environ.get("LIVEKIT_API_SECRET", "").strip()
     missing = [n for n, v in (("LIVEKIT_URL", url), ("LIVEKIT_API_KEY", key), ("LIVEKIT_API_SECRET", secret)) if not v]
-    if missing and smoke_dir is None:
+    if missing:
         raise SystemExit(f"Missing in .env: {', '.join(missing)}")
 
-    if smoke_dir is None:
-        logger.info("Checking LiveKit credentials ...")
-        try:
-            await check_credentials(url, key, secret)
-        except Exception as exc:
-            raise SystemExit(f"LiveKit rejected the credentials or is not reachable: {exc}")
-        logger.info("LiveKit credentials are valid.")
+    logger.info("Checking LiveKit credentials ...")
+    try:
+        await check_credentials(url, key, secret)
+    except Exception as exc:
+        raise SystemExit(f"LiveKit rejected the credentials or is not reachable: {exc}")
+    logger.info("LiveKit credentials are valid.")
     if torch.cuda.is_available():
         for index in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(index)
@@ -2456,9 +2332,6 @@ async def main(smoke_dir: str | None = None, test_audio: str | None = None) -> N
         logger.warning("Cohere ASR is enabled but HF_TOKEN is missing - the repo is gated, so loading will fail.")
 
     asr, translator, speech = await asyncio.to_thread(prepare_models)
-    if smoke_dir is not None:
-        await asyncio.to_thread(run_smoke_test, asr, translator, speech, smoke_dir, test_audio)
-        return
     while True:
         try:
             await run_room(asr, translator, speech, url, key, secret)
@@ -2469,17 +2342,6 @@ async def main(smoke_dir: str | None = None, test_audio: str | None = None) -> N
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--smoke-test", metavar="OUTPUT_DIR",
-                        help="Run offline model checks, save German audio and metrics, then exit.")
-    parser.add_argument("--test-audio", metavar="PATH",
-                        help="Optional short Arabic WAV/FLAC for the offline ASR check.")
-    args = parser.parse_args()
-    if args.test_audio and args.smoke_test is None:
-        parser.error("--test-audio requires --smoke-test OUTPUT_DIR")
-
     def stop_on_sigterm(signum, _frame) -> None:
         # The notebook stops the agent with SIGTERM: stop llama-server first so
         # its VRAM is freed even if a model call delays the interpreter exit.
@@ -2491,6 +2353,6 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
-        asyncio.run(main(args.smoke_test, args.test_audio))
+        asyncio.run(main())
     except KeyboardInterrupt:
         pass
