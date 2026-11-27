@@ -72,7 +72,7 @@ You need:
 Accept the Hugging Face access terms for:
 
 - [Cohere Transcribe Arabic](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026)
-- [TranslateGemma](https://huggingface.co/google/translategemma-12b-it)
+- [TranslateGemma 12B FP16](https://huggingface.co/google/translategemma-12b-it)
 - [Gradium Phonon German](https://huggingface.co/gradium/phonon-40m-de)
 
 Create a read-capable Hugging Face token at
@@ -119,7 +119,7 @@ Pod template or deployment form before launching the Pod.
    Replace `<YOUR_REGISTRY>` with your Docker Hub username or registry
    namespace.
 
-6. Select a GPU with at least **48 GB of VRAM**.
+6. Select a GPU with at least **48 GB of VRAM** for the FP16 12B model and ASR.
 7. Configure enough container and volume storage for downloaded model weights,
    temporary llama.cpp files, and logs.
 8. Do not expose any HTTP or TCP port. The bot uses outbound LiveKit
@@ -128,15 +128,14 @@ Pod template or deployment form before launching the Pod.
 
 ### GPU selection
 
-The default image runs both Cohere ASR and TranslateGemma 12B on one GPU.
+The default image runs both Cohere ASR and the unquantized TranslateGemma 12B FP16 model on one GPU.
 
-- A 48 GB GPU is the documented starting point.
+- A 48 GB GPU is the documented starting point. Memory use can vary with the context window and inference caches.
 - ASR and translation share `cuda:0` in this default profile.
 - TTS runs on the CPU.
 - Use a Secure Cloud GPU for the most predictable network and GPU behavior.
 
-GPU availability and model memory can change. If the model or llama.cpp server
-fails to load, use a larger GPU or switch to the transformers fallback profile.
+GPU availability and model memory can change. If the model fails to load, use a larger GPU or lower the context window.
 
 ## 4. Add environment variables
 
@@ -175,11 +174,11 @@ The Docker image already sets these defaults. Add them explicitly if you are
 creating a custom Runpod template or overriding an earlier template:
 
 ```text
-TRANSLATION_ENGINE=llamacpp
+TRANSLATION_ENGINE=transformers
 TRANSLATION_BACKEND=translategemma
 TRANSLATION_MODEL=google/translategemma-12b-it
-LLAMA_GGUF_REPO=mradermacher/translategemma-12b-it-GGUF
-LLAMA_GGUF_FILE=translategemma-12b-it.Q8_0.gguf
+TRANSLATION_DTYPE=float16
+TRANSLATION_4BIT=0
 LLAMA_CTX=3072
 LLAMA_THREADS=1
 ASR_DEVICE=cuda:0
@@ -201,9 +200,10 @@ LIVEKIT_URL: wss://your-project.livekit.cloud
 LIVEKIT_API_KEY: APIxxxxxxxx
 LIVEKIT_API_SECRET: xxxxxxxxxxxxxxxx
 LIVEKIT_ROOM: arabic-asr-live
-TRANSLATION_ENGINE: llamacpp
+TRANSLATION_ENGINE: transformers
 TRANSLATION_BACKEND: translategemma
 TRANSLATION_MODEL: google/translategemma-12b-it
+TRANSLATION_DTYPE: float16
 ASR_DEVICE: cuda:0
 TRANSLATION_DEVICE: cuda:0
 TTS_DEVICE: cpu

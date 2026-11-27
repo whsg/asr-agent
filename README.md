@@ -288,7 +288,7 @@ For complete image build, Push, Pod configuration, and environment-variable
 instructions, see [RUNPOD_DEPLOYMENT.md](./RUNPOD_DEPLOYMENT.md).
 
 The repository includes a Runpod-friendly container for a **single 48 GB GPU**.
-It does not use a persistent model cache: Hugging Face weights and GGUF files
+It does not use a persistent model cache: Hugging Face FP16 weights
 are downloaded from Hugging Face on container startup and remain only in the
 container's ephemeral storage.
 
@@ -307,9 +307,10 @@ LIVEKIT_URL=wss://your-project.livekit.cloud
 LIVEKIT_API_KEY=...
 LIVEKIT_API_SECRET=...
 LIVEKIT_ROOM=arabic-asr-live
-TRANSLATION_ENGINE=llamacpp
+TRANSLATION_ENGINE=transformers
 TRANSLATION_BACKEND=translategemma
 TRANSLATION_MODEL=google/translategemma-12b-it
+TRANSLATION_DTYPE=float16
 ASR_DEVICE=cuda:0
 TRANSLATION_DEVICE=cuda:0
 TTS_DEVICE=cpu

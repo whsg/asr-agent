@@ -36,11 +36,11 @@ COPY bot.py ./
 COPY runpod-entrypoint.sh ./
 RUN chmod +x runpod-entrypoint.sh
 
-ENV TRANSLATION_ENGINE=llamacpp \
+ENV TRANSLATION_ENGINE=transformers \
     TRANSLATION_BACKEND=translategemma \
     TRANSLATION_MODEL=google/translategemma-12b-it \
-    LLAMA_GGUF_REPO=mradermacher/translategemma-12b-it-GGUF \
-    LLAMA_GGUF_FILE=translategemma-12b-it.Q8_0.gguf \
+    TRANSLATION_DTYPE=float16 \
+    TRANSLATION_4BIT=0 \
     LLAMA_CTX=3072 \
     LLAMA_THREADS=1 \
     LLAMA_SERVER_LOG=/tmp/llama-server.log \
