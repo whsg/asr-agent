@@ -1,19 +1,64 @@
 # Deploy this app on Runpod
 
-This repository's Docker image runs the live speech-to-speech bot as a
-long-running process. Deploy it as a **Runpod Pod**, not as a Runpod Serverless
-endpoint.
+This app runs continuously as a **Runpod Pod**, not as a Serverless endpoint.
+Choose either the Runpod Base setup below (no image build; starts both the bot
+and web backend) or the Docker image path that follows.
 
-The bot does not expose a web server. It:
+## Runpod Base (no Docker image)
 
-1. loads the ASR, translation, and TTS models;
-2. connects outward to LiveKit Cloud;
-3. joins a LiveKit room; and
-4. publishes and consumes audio for that room.
+1. Deploy a GPU Pod using Runpod Base for **Ubuntu 24.04 with CUDA 12.8.1**.
+   Clone or copy this repository to `/workspace/asr-agent` and use persistent
+   workspace storage if available. Upload the source and `.env` separately;
+   do not upload a local `.venv` or model cache.
+2. Add these values in the Pod's environment settings. Store credentials as
+   secrets; do not put them in the Dockerfile or commit them:
+   - `LIVEKIT_URL`
+   - `LIVEKIT_API_KEY`
+   - `LIVEKIT_API_SECRET`
+   - `HF_TOKEN`
+   - Optionally, `LIVEKIT_ROOM` (defaults to `arabic-asr-live`)
 
-Run the FastAPI web client separately on your PC or on another server.
+   Before first startup, accept Hugging Face access for
+   [Cohere Transcribe Arabic](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026)
+   and [Gradium Phonon German](https://huggingface.co/gradium/phonon-40m-de)
+   using the account that owns `HF_TOKEN`.
 
-## Prerequisites
+   Alternatively, fill in the blank, git-ignored `.env` file in your local
+   repository root (`notepad .env` on Windows), then upload it to
+   `/workspace/asr-agent/.env`. Pod environment variables override values from
+   `.env`. Transfer it using the Pod's SSH details, for example:
+
+   ```powershell
+   scp -P PORT -i "C:\path\to\ssh-key" .env USER@HOST:/workspace/asr-agent/.env
+   ```
+
+   Replace `PORT`, the key path, `USER`, and `HOST` with the SSH details shown
+   for your Pod. After transfer, run `chmod 600 /workspace/asr-agent/.env` in
+   the Pod terminal. Do not upload `.env` to GitHub or share it in chat.
+3. Expose port `8000` as HTTP in the Pod settings.
+4. In the Pod terminal, run:
+
+   ```bash
+   cd /workspace/asr-agent
+   bash runpod-start.sh
+   ```
+
+On the first run, the script installs system and Python dependencies, checks
+that PyTorch can use the GPU, then starts the bot and FastAPI backend together.
+The bot downloads its models on first startup. Hugging Face model files are
+stored in `/workspace/.cache/huggingface`. The script uses the bot's code
+defaults (Qwen3 4B with Transformers); Dockerfile
+environment defaults are not applied to a Runpod Base Pod.
+
+Open the Pod's HTTP proxy URL for the web client; `/api/health` checks the web
+backend. The backend is intentionally public in this setup, but `/api/session`
+has no authentication and issues 30-minute LiveKit participant tokens to
+anyone who can reach it. Do not expose it to untrusted users without adding
+access control and rate limiting.
+
+## Docker image path
+
+### Prerequisites
 
 You need:
 
@@ -38,32 +83,22 @@ Create a read-capable Hugging Face token at
 Run this command from the repository root:
 
 ```powershell
-docker build --platform linux/amd64 -t <YOUR_REGISTRY>/asr-agent:runpod .
+$Image = "YOUR_REGISTRY/asr-agent:runpod"
+docker build --platform linux/amd64 -t $Image .
 ```
 
-For Docker Hub, `<YOUR_REGISTRY>` is normally your Docker Hub username. Example:
-
-```powershell
-docker build --platform linux/amd64 -t hesham/asr-agent:runpod .
-```
+Replace `YOUR_REGISTRY` with your Docker Hub username or registry namespace.
 
 Do not rely on a locally built Windows image. Runpod requires the Linux AMD64
 image specified by `--platform linux/amd64`.
 
 ## 2. Push the image
 
-Log in and push:
+Log in and push the same image:
 
 ```powershell
 docker login
-docker push <YOUR_REGISTRY>/asr-agent:runpod
-```
-
-Docker Hub example:
-
-```powershell
-docker login
-docker push hesham/asr-agent:runpod
+docker push $Image
 ```
 
 If the registry is private, configure the registry credentials in the Runpod
